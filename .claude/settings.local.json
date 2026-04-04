@@ -5,7 +5,9 @@
       "Bash(pip install:*)",
       "Bash(py --version)",
       "Bash(python3 -m pip install aiosqlite -q)",
-      "Bash(python3 -m persistence.database --init)"
+      "Bash(python3 -m persistence.database --init)",
+      "Bash(python3 -m pip install requests cryptography -q)",
+      "Bash(grep -v \"^[[:space:]]*$\")"
     ]
   }
 }
