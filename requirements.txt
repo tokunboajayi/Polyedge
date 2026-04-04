@@ -1,0 +1,10 @@
+anthropic
+aiohttp
+feedparser
+python-dotenv
+b2sdk
+requests
+pytest
+aiosqlite
+websockets
+cryptography

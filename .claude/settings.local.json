@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m persistence.database --init)",
+      "Bash(pip install:*)",
+      "Bash(py --version)",
+      "Bash(python3 -m pip install aiosqlite -q)",
+      "Bash(python3 -m persistence.database --init)"
+    ]
+  }
+}
