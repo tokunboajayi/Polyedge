@@ -444,8 +444,9 @@ async def seed(
         "\nSeeding complete\n"
         "  Total API markets fetched : %d\n"
         "  Supported & seeded        : %d\n"
-        "  Skipped (excl. category)  : %d",
-        total_fetched, total_supported, total_skipped,
+        "  Sports (early-skipped)    : %d\n"
+        "  Skipped (other category)  : %d",
+        total_fetched, total_supported, total_sports, total_skipped,
     )
 
     return total_supported
@@ -464,12 +465,21 @@ def _parse_args() -> argparse.Namespace:
         help="Stop after seeding this many supported-category markets (default 200).",
     )
     p.add_argument(
-        "--max-pages", type=int, default=25,
-        help="Hard ceiling on paginated API calls (default 25).",
+        "--max-pages", type=int, default=50,
+        help="Hard ceiling on paginated API calls (default 50).",
     )
     p.add_argument(
         "--no-history", action="store_true",
         help="Skip per-market price-history fetches (faster but no open_price).",
+    )
+    p.add_argument(
+        "--before-date", default=_DEFAULT_BEFORE_DATE,
+        metavar="YYYY-MM-DD",
+        help=(
+            "Only fetch markets whose close_time < this date "
+            f"(default {_DEFAULT_BEFORE_DATE}).  "
+            "Lowers the cutoff to skip the recent sports-parlay firehose."
+        ),
     )
     return p.parse_args()
 
@@ -481,12 +491,13 @@ if __name__ == "__main__":
             target=args.target,
             max_pages=args.max_pages,
             fetch_history=not args.no_history,
+            before_date=args.before_date,
         )
     )
     if seeded < args.target:
         logger.warning(
             "Only %d supported markets seeded (target was %d). "
-            "Try increasing --max-pages or check the API.",
+            "Try --before-date 2024-07-01 or increase --max-pages.",
             seeded, args.target,
         )
         sys.exit(0)   # not a hard failure — backtest will work with what's there
