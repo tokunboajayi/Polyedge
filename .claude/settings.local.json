@@ -7,7 +7,25 @@
       "Bash(python3 -m pip install aiosqlite -q)",
       "Bash(python3 -m persistence.database --init)",
       "Bash(python3 -m pip install requests cryptography -q)",
-      "Bash(grep -v \"^[[:space:]]*$\")"
+      "Bash(grep -v \"^[[:space:]]*$\")",
+      "Bash(python3 -m pip install websockets -q)",
+      "Bash(python3 tests/test_kalshi_websocket.py)",
+      "Bash(python3 -m tests.test_kalshi_websocket)",
+      "Bash(python3 -m pip install feedparser aiohttp -q)",
+      "Bash(python3 -m tests.test_rss_and_regulatory)",
+      "Bash(python3 -m tests.test_market_scanner)",
+      "Bash(python3 -m tests.test_slack_alerts)",
+      "Bash(sed:*)",
+      "Bash(python -m pytest tests/test_claude_analyzer.py -v)",
+      "Bash(python3 -m pytest tests/test_claude_analyzer.py -v)",
+      "Bash(where python3:*)",
+      "Bash(where py:*)",
+      "Bash(py -3.11 -m pytest --version)",
+      "Bash(py -3.12 -m pytest --version)",
+      "Bash(py -3.13 -m pytest --version)",
+      "Bash(py:*)",
+      "Bash(python -m pytest tests/test_backup.py tests/test_daily_report.py tests/test_edge_erosion.py -v)",
+      "Bash(python:*)"
     ]
   }
 }
