@@ -15,25 +15,24 @@ What it stores (per market)
 The three extra columns (open_price, result, price_history) are added via
 ALTER TABLE if they do not yet exist in the schema.
 
-Why --before-date matters
---------------------------
-  Kalshi's settled-market feed is reverse-chronological.  The most recent
-  thousands of markets are dominated by sports parlays (MVE* tickers) that
-  belong to no supported category.  Passing --before-date skips past this
-  firehose by setting a max_close_ts filter so the API only returns markets
-  that closed before the given date.  The default (2025-01-01) lands squarely
-  in the US-election and economic-data settlement window.
+Events-first strategy
+----------------------
+  The /markets?status=settled endpoint no longer populates the ``category``
+  or ``series_ticker`` fields, making category-based filtering impossible.
+  Instead we use /events?status=settled&with_nested_markets=true, which:
+    • Returns the event-level ``category`` field (Politics, Economics, etc.)
+    • Includes child markets and their outcomes inline — no extra API calls
+  We map Kalshi event categories to PolyEdge canonical categories and skip
+  events in unsupported categories (sports, entertainment, etc.) outright.
 
 Usage
 -----
     python scripts/seed_data.py [--target N] [--max-pages M] [--no-history]
-                                [--before-date YYYY-MM-DD]
 
 Options
-    --target N           Stop once N supported-category markets are seeded (default 200)
-    --max-pages M        Hard page limit for the /markets endpoint (default 50)
-    --no-history         Skip per-market /history fetches (faster; no open_price data)
-    --before-date DATE   Only fetch markets whose close_time < DATE (default 2025-01-01)
+    --target N      Stop once N supported-category markets are seeded (default 200)
+    --max-pages M   Hard page limit for the /events endpoint (default 15)
+    --no-history    Skip per-market /history fetches (faster; no open_price data)
 """
 
 import argparse
@@ -80,26 +79,27 @@ _SLEEP_BETWEEN = 0.08     # seconds between history fetches (~12/sec, well withi
 # The Kalshi settled feed is reverse-chronological; the most recent pages are
 # dominated by sports parlays (MVE* series).  This date lands in the US-election
 # and economic-data settlement window where supported-category markets are dense.
-_DEFAULT_BEFORE_DATE = "2025-01-01"
-
-# Series-ticker prefixes that are always sports — skip without category lookup.
-# Keeps the per-page inner loop fast and the log clean.
-_SPORTS_SERIES_PREFIXES: frozenset[str] = frozenset({
-    "MVE",    # multi-variable events (sports parlays)
-    "NBA",    # NBA game outcomes
-    "NFL",    # NFL game outcomes
-    "NHL",    # NHL game outcomes
-    "MLB",    # MLB game outcomes
-    "UFC",    # UFC fights
-    "PGA",    # golf
-    "WNBA",   # WNBA
-    "NCAA",   # college sports
-    "FIFA",   # soccer
-    "EPL",    # English Premier League
-    "MLS",    # Major League Soccer
-    "NCAAF",  # college football
-    "NCAAB",  # college basketball
-})
+# Maps Kalshi event-level category strings (returned by /events) to PolyEdge
+# canonical categories.  This is the primary category source — it supersedes
+# the ticker-prefix inference used as a fallback.
+_EVENT_CATEGORY_MAP: dict[str, str] = {
+    "politics":              "politics",
+    "elections":             "politics",
+    "economics":             "economics",
+    "financials":            "economics",
+    "macro":                 "macro",
+    "crypto":                "tech",
+    "science and technology":"tech",
+    "technology":            "tech",
+    "regulatory":            "regulatory",
+    # Explicitly unsupported — will be skipped
+    "sports":                "sports",
+    "entertainment":         "entertainment",
+    "health":                "health",
+    "social":                "social",
+    "world":                 "world",
+    "companies":             "companies",
+}
 
 
 def _get(path: str, params: dict | None = None) -> dict:
@@ -110,51 +110,71 @@ def _get(path: str, params: dict | None = None) -> dict:
     return resp.json()
 
 
-def _fetch_settled_page(
+def _fetch_settled_events_page(
     cursor: str | None = None,
-    max_close_ts: int | None = None,
 ) -> tuple[list[dict], str | None]:
-    """Fetch one page of settled markets.
+    """Fetch one page of settled events with nested markets.
 
-    Args:
-        cursor:       Pagination cursor from the previous response.
-        max_close_ts: Unix timestamp (seconds).  If set, only markets whose
-                      close_time < this value are returned.  Use this to skip
-                      the recent sports-parlay firehose and land in an era with
-                      dense economics / politics settlements.
+    Uses ``with_nested_markets=true`` so each event dict already contains its
+    child market outcomes — avoiding a per-market fetch and giving us the
+    event-level ``category`` field that the /markets endpoint no longer populates.
 
-    Returns (markets_list, next_cursor).  next_cursor is None when exhausted.
+    Returns (events_list, next_cursor).  next_cursor is None when exhausted.
     """
-    params: dict = {"status": "settled", "limit": _PAGE_LIMIT}
+    params: dict = {
+        "status":               "settled",
+        "limit":                _PAGE_LIMIT,
+        "with_nested_markets":  "true",
+    }
     if cursor:
         params["cursor"] = cursor
-    if max_close_ts is not None:
-        params["max_close_ts"] = max_close_ts
-    data    = _get("/markets", params=params)
-    markets = data.get("markets", [])
-    nxt     = data.get("cursor") or None
-    return markets, nxt
+    data   = _get("/events", params=params)
+    events = data.get("events", [])
+    nxt    = data.get("cursor") or None
+    return events, nxt
 
 
 def _fetch_price_history(ticker: str) -> list[dict]:
     """Fetch up to _HISTORY_LIMIT price-history points for a market.
 
-    Returns a list of {"ts": int, "yes_price": float} dicts sorted
-    oldest → newest, or [] on error.
+    Handles both API formats:
+      - New (dollars): yes_price_dollars / yes_bid_dollars as string floats
+      - Old (cents):   yes_price / yes_bid as integers
+
+    Returns a list of {"ts": int, "yes_price": float} dicts sorted oldest → newest.
     """
     try:
         data = _get(
             f"/markets/{ticker}/history",
             params={"limit": _HISTORY_LIMIT},
         )
-        raw = data.get("history", [])
+        raw_points = data.get("history", [])
         points = []
-        for p in raw:
+        for p in raw_points:
             ts = p.get("ts") or p.get("timestamp") or 0
-            yp = p.get("yes_price") or p.get("yes_bid")
-            if ts and yp is not None:
-                # API returns integer cents; convert to dollars
-                points.append({"ts": int(ts), "yes_price": float(yp) / 100.0})
+            if not ts:
+                continue
+            # Try dollar-format fields first (new API), then cent-format (old API)
+            yp = None
+            for field in ("yes_price_dollars", "yes_bid_dollars", "yes_ask_dollars"):
+                v = p.get(field)
+                if v is not None:
+                    try:
+                        yp = float(v)
+                    except (TypeError, ValueError):
+                        pass
+                    break
+            if yp is None:
+                for field in ("yes_price", "yes_bid"):
+                    v = p.get(field)
+                    if v is not None:
+                        try:
+                            yp = float(v) / 100.0
+                        except (TypeError, ValueError):
+                            pass
+                        break
+            if yp is not None:
+                points.append({"ts": int(ts), "yes_price": yp})
         return sorted(points, key=lambda x: x["ts"])
     except Exception as exc:
         logger.debug("history_fetch_failed  ticker=%s  error=%s", ticker, exc)
@@ -162,18 +182,166 @@ def _fetch_price_history(ticker: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Category normalisation (reuse market_scanner logic)
+# Price / volume parsing helpers (dual API format support)
 # ---------------------------------------------------------------------------
 
-def _normalise_category(raw: str) -> str:
-    """Map a Kalshi raw category to a PolyEdge canonical category."""
-    key = (raw or "").lower().strip()
-    if key in CATEGORY_MAP:
-        return CATEGORY_MAP[key]
-    for map_key, canonical in CATEGORY_MAP.items():
-        if map_key in key or (key and key in map_key):
-            return canonical
+def _parse_yes_price(raw: dict) -> float:
+    """Return yes settlement price as a dollar float (0.0–1.0).
+
+    New API: yes_ask_dollars / settlement_value_dollars (string, e.g. "1.0000")
+    Old API: yes_ask (integer cents, e.g. 100)
+    """
+    # settlement_value_dollars is the most reliable for finalized markets
+    for field in ("settlement_value_dollars",):
+        v = raw.get(field)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    # yes_ask_dollars / no_ask_dollars
+    for field in ("yes_ask_dollars", "last_price_dollars"):
+        v = raw.get(field)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    # Cent fallback
+    for field in ("yes_ask", "last_price"):
+        v = raw.get(field)
+        if v is not None:
+            try:
+                return float(v) / 100.0
+            except (TypeError, ValueError):
+                pass
+    return 0.0
+
+
+def _parse_volume(raw: dict) -> float:
+    """Return trade volume as a float (contract count)."""
+    for field in ("volume_fp", "volume", "volume_24h_fp", "volume_24h"):
+        v = raw.get(field)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                pass
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Category normalisation — API field + ticker-prefix fallback
+# ---------------------------------------------------------------------------
+
+# Maps the series prefix extracted from event_ticker / ticker to a PolyEdge
+# canonical category.  Keys are uppercase series prefixes.
+_SERIES_PREFIX_CATEGORY: dict[str, str] = {
+    # Economics / financial
+    "KXWTI":    "macro",       # WTI crude oil
+    "KXBRENT":  "macro",       # Brent crude
+    "KXGAS":    "macro",       # natural gas
+    "KXGOLD":   "macro",       # gold
+    "KXSILVER": "macro",       # silver
+    "KXDXY":    "macro",       # US dollar index
+    "KXINX":    "economics",   # S&P 500 (INX)
+    "KXNDAQ":   "economics",   # NASDAQ
+    "KXDJI":    "economics",   # Dow Jones
+    "KXFED":    "economics",   # Fed funds rate
+    "KXCPI":    "economics",   # CPI / inflation
+    "KXPCE":    "economics",   # PCE inflation
+    "KXGDP":    "economics",   # GDP
+    "KXUNEM":   "economics",   # unemployment
+    "KXPAYROLL":"economics",   # nonfarm payrolls
+    "KXJOBS":   "economics",   # jobs report
+    "KXHOUSING":"economics",   # housing data
+    "KXRETAIL": "economics",   # retail sales
+    "INX":      "economics",   # S&P 500 direct
+    "NASDAQ":   "economics",   # NASDAQ direct
+    "INXD":     "economics",   # S&P 500 daily
+    # Tech / crypto
+    "KXBTC":    "tech",        # Bitcoin
+    "KXETH":    "tech",        # Ethereum
+    "KXSOL":    "tech",        # Solana
+    "KXXRP":    "tech",        # XRP
+    "KXDOGE":   "tech",        # Dogecoin
+    "KXBNB":    "tech",        # BNB
+    "BTCUSD":   "tech",
+    "ETHUSD":   "tech",
+    # Politics
+    "PRES":     "politics",    # presidential
+    "KXTRUMP":  "politics",
+    "KXBIDEN":  "politics",
+    "KXHARRIS": "politics",
+    "KXELECT":  "politics",
+    "KXGOV":    "politics",
+    "KXPOL":    "politics",
+    "CONGRESS": "politics",
+    "SENATE":   "politics",
+    "HOUSE":    "politics",
+    "KXSEN":    "politics",    # senate seat
+    "KXREP":    "politics",    # house seat
+    "KXPRIMARY":"politics",
+    "KXAPPROVAL":"politics",
+    # Regulatory
+    "KXCFTC":   "regulatory",
+    "KXSEC":    "regulatory",
+    "KXREG":    "regulatory",
+    "KXFDA":    "regulatory",
+    "KXDOJ":    "regulatory",
+}
+
+
+def _category_from_ticker(ticker: str, event_ticker: str) -> str:
+    """Infer PolyEdge category from ticker / event_ticker when category is null.
+
+    Extracts the series prefix (everything before the first '-') from
+    event_ticker (preferred) or ticker, then looks it up in _SERIES_PREFIX_CATEGORY.
+    Falls back to keyword scanning of the full ticker string.
+    """
+    for candidate in (event_ticker or "", ticker or ""):
+        prefix = candidate.split("-")[0].upper().strip()
+        if prefix in _SERIES_PREFIX_CATEGORY:
+            return _SERIES_PREFIX_CATEGORY[prefix]
+
+    # Keyword scan of full strings (handles e.g. "PRESWIN2024-TRUMP")
+    combined = f"{ticker} {event_ticker}".upper()
+    if any(k in combined for k in ("TRUMP", "BIDEN", "HARRIS", "ELECTION", "SENATE",
+                                    "HOUSE", "CONGRESS", "PRESIDENT", "GOVERNOR",
+                                    "PRES", "KXGOV", "KXSEN")):
+        return "politics"
+    if any(k in combined for k in ("BTC", "ETH", "CRYPTO", "SOL", "DOGE", "XRP")):
+        return "tech"
+    if any(k in combined for k in ("FED", "CPI", "GDP", "PAYROLL", "JOBS", "UNEM",
+                                    "RATE", "INFLATION", "INX", "S&P", "NASDAQ",
+                                    "DOW", "WTI", "OIL", "GOLD", "SILVER")):
+        return "economics"
+    if any(k in combined for k in ("CFTC", "SEC", "FDA", "DOJ", "REGULATION", "RULE")):
+        return "regulatory"
     return "unknown"
+
+
+def _normalise_category(raw_category: str, ticker: str = "", event_ticker: str = "") -> str:
+    """Map a Kalshi raw category to a PolyEdge canonical category.
+
+    Priority order:
+      1. _EVENT_CATEGORY_MAP  — direct match on the event category string
+         (returned by /events endpoint; e.g. "Politics", "Economics")
+      2. CATEGORY_MAP         — market_scanner legacy map (e.g. "financials")
+      3. _category_from_ticker — ticker-prefix inference as final fallback
+    """
+    key = (raw_category or "").lower().strip()
+    if key:
+        if key in _EVENT_CATEGORY_MAP:
+            return _EVENT_CATEGORY_MAP[key]
+        if key in CATEGORY_MAP:
+            return CATEGORY_MAP[key]
+        for map_key, canonical in CATEGORY_MAP.items():
+            if map_key in key or (key and key in map_key):
+                return canonical
+
+    # API category field was empty — infer from ticker prefix
+    return _category_from_ticker(ticker, event_ticker)
 
 
 # ---------------------------------------------------------------------------
@@ -199,14 +367,31 @@ def _settlement_date(raw: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def _extract_result(raw: dict) -> str | None:
-    """Return 'yes' | 'no' | None from a settled market dict."""
+    """Return 'yes' | 'no' | None from a settled/finalized market dict.
+
+    Handles both API formats:
+      New API: result field is "yes"/"no"; settlement_value_dollars is "1.0000"/"0.0000"
+      Old API: result field is "yes"/"no"; yes_ask is integer cents (100 = yes, 0 = no)
+    """
     result = raw.get("result")
     if isinstance(result, str):
         r = result.lower().strip()
         if r in ("yes", "no"):
             return r
 
-    # Fall back to yes_ask: 100 cents = YES won, 0 cents = NO won
+    # New API: settlement_value_dollars — "1.0000" = YES won, "0.0000" = NO won
+    svd = raw.get("settlement_value_dollars")
+    if svd is not None:
+        try:
+            v = float(svd)
+            if v >= 0.99:
+                return "yes"
+            if v <= 0.01:
+                return "no"
+        except (TypeError, ValueError):
+            pass
+
+    # Old API: yes_ask integer cents — 100 = YES won, 0 = NO won
     yes_ask = raw.get("yes_ask")
     if yes_ask is not None:
         try:
@@ -217,6 +402,20 @@ def _extract_result(raw: dict) -> str | None:
                 return "no"
         except (TypeError, ValueError):
             pass
+
+    # New API: yes_ask_dollars — "1.0000" = YES won, "0.0200" = NO won (residual ask)
+    for field in ("yes_ask_dollars", "last_price_dollars"):
+        v = raw.get(field)
+        if v is not None:
+            try:
+                fv = float(v)
+                if fv >= 0.99:
+                    return "yes"
+                if fv <= 0.01:
+                    return "no"
+            except (TypeError, ValueError):
+                pass
+
     return None
 
 
@@ -275,19 +474,14 @@ async def _upsert_market(db, row: dict) -> None:
 
 async def seed(
     target: int = 200,
-    max_pages: int = 50,
+    max_pages: int = 15,
     fetch_history: bool = True,
-    before_date: str = _DEFAULT_BEFORE_DATE,
 ) -> int:
-    """Fetch settled markets and populate the DB.
+    """Fetch settled events+markets from Kalshi and populate the DB.
 
-    Args:
-        target:       Stop once this many supported-category markets are seeded.
-        max_pages:    Hard ceiling on paginated API requests.
-        fetch_history: Whether to fetch per-market price history.
-        before_date:  ISO date string (YYYY-MM-DD).  Only markets whose
-                      close_time < this date are fetched.  Defaults to
-                      2025-01-01 to skip the recent sports-parlay firehose.
+    Uses /events?status=settled&with_nested_markets=true so we get:
+      • event-level category (Politics, Economics, etc.)
+      • child market outcomes inline — no extra per-market API calls
 
     Returns the number of supported-category markets seeded.
     """
@@ -296,140 +490,108 @@ async def seed(
     async with get_connection() as db:
         await _ensure_extra_columns(db)
 
-    # Convert before_date to a Unix timestamp for the API filter
-    try:
-        before_dt    = datetime.strptime(before_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        max_close_ts = int(before_dt.timestamp())
-    except ValueError:
-        logger.warning("Invalid --before-date %r — ignoring date filter", before_date)
-        max_close_ts = None
+    now_str         = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    cursor          = None
+    total_events    = 0
+    total_markets   = 0
+    total_supported = 0
+    total_skipped   = 0
 
-    now_str  = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    cursor   = None
-    total_fetched    = 0
-    total_supported  = 0
-    total_skipped    = 0
-    total_sports     = 0
-
-    logger.info(
-        "Starting seed — target=%d  max_pages=%d  before=%s",
-        target, max_pages, before_date,
-    )
+    logger.info("Starting seed — target=%d  max_pages=%d", target, max_pages)
 
     for page_num in range(1, max_pages + 1):
-        logger.info("Fetching page %d (supported so far: %d/%d) …",
+        logger.info("Fetching events page %d (supported markets so far: %d/%d) …",
                     page_num, total_supported, target)
 
         try:
-            markets, cursor = _fetch_settled_page(cursor, max_close_ts=max_close_ts)
+            events, cursor = _fetch_settled_events_page(cursor)
         except requests.HTTPError as exc:
             logger.error("API error on page %d: %s", page_num, exc)
             break
 
-        if not markets:
-            logger.info("No more markets returned — stopping pagination.")
+        if not events:
+            logger.info("No more events returned — stopping pagination.")
             break
 
-        total_fetched += len(markets)
+        total_events += len(events)
 
-        # ---- Batch DB writes ----
         async with get_connection() as db:
             batch_written = 0
 
-            for raw in markets:
-                # ── Early-exit: skip known sports series without category lookup ──
-                series_ticker = raw.get("series_ticker", "") or ""
-                if any(series_ticker.upper().startswith(pfx) for pfx in _SPORTS_SERIES_PREFIXES):
-                    total_sports += 1
-                    continue
+            for event in events:
+                event_ticker    = event.get("event_ticker", "") or ""
+                event_category  = event.get("category", "") or ""
+                event_title     = event.get("title", "") or ""
 
-                ticker_raw = raw.get("ticker", "") or ""
-                if any(ticker_raw.upper().startswith(pfx) for pfx in _SPORTS_SERIES_PREFIXES):
-                    total_sports += 1
-                    continue
-
-                category = _normalise_category(raw.get("category", ""))
-                if category not in SUPPORTED_CATEGORIES:
-                    total_skipped += 1
-                    continue
-
-                result = _extract_result(raw)
-                if result is None:
-                    # No deterministic outcome — skip (can't backtest without it)
-                    total_skipped += 1
-                    continue
-
-                ticker = raw.get("ticker", "")
-                if not ticker:
-                    continue
-
-                # Final settlement prices (0 or 100 cents → 0.0 or 1.0 dollars)
-                yes_price = float(raw.get("yes_ask", 0) or 0) / 100.0
-                no_price  = float(raw.get("no_ask",  0) or 0) / 100.0
-
-                # Volume — Kalshi volume field is total contracts; approximate dollars
-                # using the best available mid-price from before settlement.
-                volume_raw = (
-                    raw.get("volume")
-                    or raw.get("volume_24h")
-                    or 0
+                # Map event category to PolyEdge canonical
+                category = _normalise_category(
+                    event_category,
+                    ticker=event_ticker,
+                    event_ticker=event_ticker,
                 )
-                try:
-                    volume_raw = float(volume_raw)
-                except (TypeError, ValueError):
-                    volume_raw = 0.0
-                # Rough conversion: multiply by $0.50 midpoint assumption for
-                # contracts that were open during the market's life.
-                volume_7d = round(volume_raw * 0.50, 2)
+                if category not in SUPPORTED_CATEGORIES:
+                    continue   # silently skip unsupported categories
 
-                # Price history
-                history_json = None
-                open_price   = None
+                nested = event.get("markets") or []
+                if not nested:
+                    continue   # no child markets inline — skip
 
-                if fetch_history and ticker:
-                    time.sleep(_SLEEP_BETWEEN)
-                    history = _fetch_price_history(ticker)
-                    if history:
-                        # open_price = earliest price that was actually mid-market
-                        # (skip trivially boundary values 0.0 and 1.0)
-                        for pt in history:
-                            yp = pt["yes_price"]
-                            if 0.02 <= yp <= 0.98:
-                                open_price = round(yp, 4)
-                                break
-                        history_json = json.dumps(history)
+                for raw in nested:
+                    total_markets += 1
+                    ticker = raw.get("ticker", "") or ""
+                    if not ticker:
+                        continue
 
-                # If no valid open_price from history, estimate from category prior
-                if open_price is None:
-                    # Will be imputed in backtest from seeded priors ± noise
-                    open_price = None
+                    result = _extract_result(raw)
+                    if result is None:
+                        total_skipped += 1
+                        continue
 
-                row = {
-                    "ticker":          ticker,
-                    "title":           raw.get("title", ""),
-                    "series":          raw.get("series_ticker", ""),
-                    "event_id":        raw.get("event_ticker", ""),
-                    "category":        category,
-                    "settlement_date": _settlement_date(raw),
-                    "status":          "settled",
-                    "yes_price":       yes_price,
-                    "no_price":        no_price,
-                    "volume_7d":       volume_7d,
-                    "last_updated":    now_str,
-                    "open_price":      open_price,
-                    "result":          result,
-                    "price_history":   history_json,
-                }
+                    yes_price = _parse_yes_price(raw)
+                    no_price  = round(1.0 - yes_price, 4)
+                    volume_7d = round(_parse_volume(raw) * 0.50, 2)
+                    series    = event_ticker.split("-")[0]
 
-                await _upsert_market(db, row)
-                batch_written += 1
-                total_supported += 1
+                    history_json = None
+                    open_price   = None
+
+                    if fetch_history:
+                        time.sleep(_SLEEP_BETWEEN)
+                        history = _fetch_price_history(ticker)
+                        if history:
+                            for pt in history:
+                                yp = pt["yes_price"]
+                                if 0.02 <= yp <= 0.98:
+                                    open_price = round(yp, 4)
+                                    break
+                            history_json = json.dumps(history)
+
+                    row = {
+                        "ticker":          ticker,
+                        "title":           raw.get("title", "") or event_title,
+                        "series":          series,
+                        "event_id":        event_ticker,
+                        "category":        category,
+                        "settlement_date": _settlement_date(raw),
+                        "status":          "settled",
+                        "yes_price":       yes_price,
+                        "no_price":        no_price,
+                        "volume_7d":       volume_7d,
+                        "last_updated":    now_str,
+                        "open_price":      open_price,
+                        "result":          result,
+                        "price_history":   history_json,
+                    }
+
+                    await _upsert_market(db, row)
+                    batch_written += 1
+                    total_supported += 1
 
             await db.commit()
 
         logger.info(
-            "Page %d done — batch=%d  supported_total=%d  fetched_total=%d",
-            page_num, batch_written, total_supported, total_fetched,
+            "Page %d done — events=%d  batch=%d  supported_total=%d",
+            page_num, len(events), batch_written, total_supported,
         )
 
         if total_supported >= target:
@@ -442,11 +604,11 @@ async def seed(
 
     logger.info(
         "\nSeeding complete\n"
-        "  Total API markets fetched : %d\n"
+        "  Events fetched            : %d\n"
+        "  Child markets seen        : %d\n"
         "  Supported & seeded        : %d\n"
-        "  Sports (early-skipped)    : %d\n"
-        "  Skipped (other category)  : %d",
-        total_fetched, total_supported, total_sports, total_skipped,
+        "  Skipped (no outcome)      : %d",
+        total_events, total_markets, total_supported, total_skipped,
     )
 
     return total_supported
@@ -465,21 +627,12 @@ def _parse_args() -> argparse.Namespace:
         help="Stop after seeding this many supported-category markets (default 200).",
     )
     p.add_argument(
-        "--max-pages", type=int, default=50,
-        help="Hard ceiling on paginated API calls (default 50).",
+        "--max-pages", type=int, default=15,
+        help="Hard ceiling on paginated /events API calls (default 15).",
     )
     p.add_argument(
         "--no-history", action="store_true",
         help="Skip per-market price-history fetches (faster but no open_price).",
-    )
-    p.add_argument(
-        "--before-date", default=_DEFAULT_BEFORE_DATE,
-        metavar="YYYY-MM-DD",
-        help=(
-            "Only fetch markets whose close_time < this date "
-            f"(default {_DEFAULT_BEFORE_DATE}).  "
-            "Lowers the cutoff to skip the recent sports-parlay firehose."
-        ),
     )
     return p.parse_args()
 
@@ -491,14 +644,13 @@ if __name__ == "__main__":
             target=args.target,
             max_pages=args.max_pages,
             fetch_history=not args.no_history,
-            before_date=args.before_date,
         )
     )
     if seeded < args.target:
         logger.warning(
             "Only %d supported markets seeded (target was %d). "
-            "Try --before-date 2024-07-01 or increase --max-pages.",
+            "Try increasing --max-pages.",
             seeded, args.target,
         )
-        sys.exit(0)   # not a hard failure — backtest will work with what's there
+        sys.exit(0)
     sys.exit(0)

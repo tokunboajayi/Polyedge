@@ -468,15 +468,15 @@ def _print_metrics(sm: StrategyMetrics, min_trades: int) -> bool:
     """Print metrics table for one strategy and return True if it passes."""
     verdict_eligible = sm.n >= min_trades
 
-    print(f"\n{'─'*60}")
+    print(f"\n{'-'*60}")
     print(f"  {_BOLD}{sm.name.upper()}{_RST}")
-    print(f"{'─'*60}")
+    print(f"{'-'*60}")
     print(f"  Trades simulated  : {sm.n}")
     print(f"  Total P&L         : ${_fmt(sm.total_pnl, '+.2f')}")
     print(f"  Win rate          : {sm.win_rate:.1%}  "
-          f"{'✓ >50%' if sm.win_rate > 0.50 else '✗ ≤50%'}")
+          f"{'[PASS] >50%' if sm.win_rate > 0.50 else '[FAIL] <=50%'}")
     print(f"  Sharpe (annualised): {_fmt(sm.sharpe, '.4f')}  "
-          f"{'✓ >0.5' if sm.sharpe > 0.5 else '✗ ≤0.5'}")
+          f"{'[PASS] >0.5' if sm.sharpe > 0.5 else '[FAIL] <=0.5'}")
     print(f"  Avg edge          : {sm.avg_edge:.2%}")
     print(f"  Brier score       : {_fmt(sm.brier, '.4f')}")
 
@@ -491,9 +491,9 @@ def _print_metrics(sm: StrategyMetrics, min_trades: int) -> bool:
     else:
         reasons = []
         if sm.sharpe <= 0.5:
-            reasons.append(f"Sharpe {sm.sharpe:.4f} ≤ 0.5")
+            reasons.append(f"Sharpe {sm.sharpe:.4f} <= 0.5")
         if sm.win_rate <= 0.50:
-            reasons.append(f"win rate {sm.win_rate:.1%} ≤ 50%")
+            reasons.append(f"win rate {sm.win_rate:.1%} <= 50%")
         print(f"  Verdict           : {_RED}{_BOLD}FAIL{_RST}  ({' / '.join(reasons)})")
         return False
 
@@ -576,13 +576,13 @@ async def run_backtest(min_trades: int = 10, verbose: bool = False) -> bool:
     # ------------------------------------------------------------------
     # Print report
     # ------------------------------------------------------------------
-    print(f"\n{'═'*60}")
+    print(f"\n{'='*60}")
     print(f"  {_BOLD}POLYEDGE BACKTEST REPORT{_RST}")
     print(f"  Markets loaded    : {total}")
     print(f"  Strategy A trades : {sm_a.n}")
     print(f"  Strategy B trades : {sm_b.n}")
     print(f"  Combined trades   : {sm_all.n}")
-    print(f"{'═'*60}")
+    print(f"{'='*60}")
 
     pass_a   = _print_metrics(sm_a,   min_trades)
     pass_b   = _print_metrics(sm_b,   min_trades)
@@ -593,7 +593,7 @@ async def run_backtest(min_trades: int = 10, verbose: bool = False) -> bool:
     # ------------------------------------------------------------------
     overall = pass_a and pass_b and pass_all
 
-    print(f"\n{'═'*60}")
+    print(f"\n{'='*60}")
     if overall:
         print(f"  {_GREEN}{_BOLD}OVERALL VERDICT: PASS{_RST}")
         print(f"  Both strategies meet Sharpe >0.5 AND win rate >50%.")
@@ -602,7 +602,7 @@ async def run_backtest(min_trades: int = 10, verbose: bool = False) -> bool:
         print(f"  {_RED}{_BOLD}OVERALL VERDICT: FAIL — STOP{_RST}")
         print(f"  One or more strategies did not meet performance thresholds.")
         print(f"  Do NOT deploy live capital until strategies are recalibrated.")
-    print(f"{'═'*60}\n")
+    print(f"{'='*60}\n")
 
     return overall
 

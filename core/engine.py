@@ -242,19 +242,23 @@ class Engine:
             )
             sys.exit(1)
 
-        logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        logger.info("-----------------------------------------------------")
         logger.info("  PolyEdge ENGINE  |  env=%s  |  dry_run=%s  |  start=%s",
                     S.KALSHI_ENV, self._dry_run,
                     self._start_time.strftime("%Y-%m-%dT%H:%MZ"))
-        logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        logger.info("-----------------------------------------------------")
 
         await init_db()
         await self._load_open_positions()
         await self._refresh_bankroll()
 
         loop = asyncio.get_event_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, lambda: self._shutdown_event.set())
+        try:
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, self._shutdown_event.set)
+        except NotImplementedError:
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                signal.signal(sig, lambda s, f: loop.call_soon_threadsafe(self._shutdown_event.set))
 
         self._alerter.system_info(
             "Production engine started",

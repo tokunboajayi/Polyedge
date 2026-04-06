@@ -37,6 +37,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
@@ -149,6 +150,8 @@ class KalshiClient:
 
         self._api_key_id: str = api_key_id or S.KALSHI_API_KEY_ID
         self._base_url: str = (base_url or S.KALSHI_BASE_URL).rstrip("/")
+        # Path prefix included in RSA-PSS signed message (e.g. "/trade-api/v2")
+        self._base_path: str = urlparse(self._base_url).path.rstrip("/")
         self._env: str = S.KALSHI_ENV
 
         key_path = Path(private_key_path or S.KALSHI_PRIVATE_KEY_PATH)
@@ -190,7 +193,8 @@ class KalshiClient:
         where `path` is the URL path without query parameters.
         """
         timestamp_ms = str(int(time.time() * 1000))
-        message = (timestamp_ms + method.upper() + path).encode("utf-8")
+        full_path = self._base_path + path
+        message = (timestamp_ms + method.upper() + full_path).encode("utf-8")
 
         signature_bytes = self._private_key.sign(
             message,
@@ -492,12 +496,13 @@ class KalshiClient:
         We convert balance and payout to dollars before returning.
         """
         data = self._request("GET", "/portfolio/balance", authenticated=True)
-        balance = data.get("balance", {})
-        # Convert cent fields to dollars for internal consistency
-        for field in ("balance", "payout"):
-            if field in balance and isinstance(balance[field], (int, float)):
-                balance[field] = balance[field] / 100
-        return balance
+        # API v2 returns flat dict: {"balance": cents, "portfolio_value": cents, ...}
+        # Convert numeric cent fields to dollars for internal consistency
+        result = dict(data)
+        for field in ("balance", "payout", "portfolio_value"):
+            if field in result and isinstance(result[field], (int, float)):
+                result[field] = result[field] / 100
+        return result
 
     def get_positions(
         self,

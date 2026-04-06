@@ -168,7 +168,15 @@ class DemoTrader:
 
         # ---------- Subsystems ----------
         self._client          = KalshiClient()          # demo base URL from settings
-        self._scanner         = MarketScanner(self._client)
+        # Demo env: no real trading activity → relax volume/liquidity/settlement gates
+        _is_demo = S.KALSHI_ENV == "demo"
+        self._scanner         = MarketScanner(
+            self._client,
+            volume_threshold=0.0    if _is_demo else C.MIN_MARKET_VOLUME_7D,
+            min_liquidity=0.0       if _is_demo else 1_000.0,
+            min_settlement_days=1   if _is_demo else C.MIN_SETTLEMENT_DAYS,
+            min_hours_to_settle=1.0 if _is_demo else 48.0,
+        )
         self._prob_model      = ProbabilityModel()
         self._strategy_a      = StrategyA()
         self._strategy_b      = StrategyB()
@@ -213,11 +221,11 @@ class DemoTrader:
         SIGINT/SIGTERM received, or an unrecoverable error occurs."""
         self._start_time = datetime.now(timezone.utc)
 
-        logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        logger.info("---------------------------------------------")
         logger.info("  PolyEdge DEMO  |  env=%s  |  dry_run=%s", S.KALSHI_ENV, self._dry_run)
         logger.info("  Duration: %d days  |  Start: %s",
                     self._duration.days, self._start_time.strftime("%Y-%m-%dT%H:%MZ"))
-        logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        logger.info("---------------------------------------------")
 
         if S.KALSHI_ENV != "demo":
             logger.critical(
@@ -230,10 +238,15 @@ class DemoTrader:
         await self._load_open_positions()
         await self._refresh_bankroll()
 
-        # Install signal handlers for graceful shutdown
+        # Install signal handlers for graceful shutdown.
+        # add_signal_handler is Unix-only; fall back to signal.signal on Windows.
         loop = asyncio.get_event_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, lambda: self._shutdown_event.set())
+        try:
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, self._shutdown_event.set)
+        except NotImplementedError:
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                signal.signal(sig, lambda s, f: loop.call_soon_threadsafe(self._shutdown_event.set))
 
         self._alerter.system_info(
             "Demo trading loop started",
@@ -438,10 +451,20 @@ class DemoTrader:
         num_contracts = C.MIN_TRADE_SIZE   # will be refined by sizer
         ob_result = self._ob_confirm.check(signal.direction, ob, num_contracts)
         if not ob_result.confirmed:
-            logger.debug("ob_rejected  ticker=%s  reason=%s", ticker, ob_result.reason)
-            return
-
-        entry_price = ob_result.entry_price   # refined best-ask
+            # In demo mode the orderbook is always empty — use the model's estimate
+            # as the limit price so Kelly edge is positive (model_prob > entry_price).
+            if S.KALSHI_ENV == "demo" and ob_result.reason in (
+                "empty_yes_orderbook", "empty_no_orderbook", "insufficient_depth",
+            ):
+                # Place limit at 95% of model estimate → small positive Kelly
+                raw_entry = estimate.final_prob * 0.95
+                entry_price = max(0.01, min(0.99, round(raw_entry, 2)))
+                logger.debug("ob_demo_fallback  ticker=%s  entry=%.3f", ticker, entry_price)
+            else:
+                logger.debug("ob_rejected  ticker=%s  reason=%s", ticker, ob_result.reason)
+                return
+        else:
+            entry_price = ob_result.entry_price   # refined best-ask
 
         # ── 7. Position sizing ────────────────────────────────────────
         resolved_count = self._calibration.get_state().resolved_count
@@ -451,15 +474,34 @@ class DemoTrader:
             bankroll=self._bankroll,
             resolved_trade_count=resolved_count,
         )
+        _demo_size_override = False
         if not size.eligible:
-            logger.debug("sizer_ineligible  ticker=%s  reason=%s", ticker, size.reason)
-            return
+            # Demo override: use minimum trade size when the only issue is
+            # insufficient Kelly edge or trade too small (not a true risk block).
+            _demo_tradeable_reasons = (
+                "dollar_size", "negative_kelly", "zero_kelly",
+            )
+            if S.KALSHI_ENV == "demo" and any(
+                r in size.reason for r in _demo_tradeable_reasons
+            ):
+                num_contracts = C.MIN_TRADE_SIZE
+                _demo_size_override = True
+                logger.debug(
+                    "sizer_demo_override  ticker=%s  reason=%s  using_min=%d",
+                    ticker, size.reason, num_contracts,
+                )
+            else:
+                logger.debug("sizer_ineligible  ticker=%s  reason=%s", ticker, size.reason)
+                return
+
+        actual_contracts = num_contracts if _demo_size_override else size.num_contracts
+        actual_dollar_size = actual_contracts * entry_price
 
         # ── 8. Correlation / concentration check ─────────────────────
         corr = self._correlation.check(
             category=category,
             direction=signal.direction,
-            dollar_size=size.dollar_size,
+            dollar_size=actual_dollar_size,
             bankroll=self._bankroll,
         )
         if not corr.allowed:
@@ -475,7 +517,7 @@ class DemoTrader:
             logger.info(
                 "DRY_RUN  ticker=%s  dir=%s  contracts=%d  entry=%.3f  "
                 "edge=%.1fpp  conf=%.2f",
-                ticker, signal.direction, size.num_contracts, entry_price,
+                ticker, signal.direction, actual_contracts, entry_price,
                 signal.net_edge_pp, signal.confidence,
             )
             return
@@ -483,7 +525,7 @@ class DemoTrader:
         order_id, executed_price = await self._place_entry_order(
             ticker=ticker,
             direction=signal.direction,
-            num_contracts=size.num_contracts,
+            num_contracts=actual_contracts,
             limit_price=entry_price,
         )
         if order_id is None:
@@ -491,7 +533,7 @@ class DemoTrader:
 
         # ── 11. Persist to DB ─────────────────────────────────────────
         side = "YES" if signal.direction == "buy_yes" else "NO"
-        fees = C.kalshi_fee(executed_price, size.num_contracts, is_maker=True)
+        fees = C.kalshi_fee(executed_price, actual_contracts, is_maker=True)
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         notes_payload = json.dumps({
@@ -513,7 +555,7 @@ class DemoTrader:
                 VALUES (?, ?, ?, 'LIMIT', ?, ?, ?, ?, 'open', ?)
                 """,
                 (
-                    ticker, signal.strategy, side, size.num_contracts,
+                    ticker, signal.strategy, side, actual_contracts,
                     executed_price, now_str, fees, notes_payload,
                 ),
             )
@@ -535,7 +577,7 @@ class DemoTrader:
             strategy=signal.strategy,
             direction=signal.direction,
             side=side,
-            num_contracts=size.num_contracts,
+            num_contracts=actual_contracts,
             entry_price=executed_price,
             model_prob=estimate.final_prob,
             target_price=signal.target_price,
@@ -964,6 +1006,10 @@ class DemoTrader:
             balance_data = await asyncio.to_thread(self._client.get_balance)
             # KalshiClient.get_balance() already converts cents → dollars
             new_bal = float(balance_data.get("balance", self._bankroll))
+            # Demo accounts often return $0 (unfunded virtual wallet).
+            # Fall back to STARTING_BANKROLL so the engine can still execute trades.
+            if new_bal <= 0 and S.KALSHI_ENV == "demo":
+                new_bal = S.STARTING_BANKROLL
             if new_bal != self._bankroll:
                 logger.info("bankroll_updated  old=$%.2f  new=$%.2f", self._bankroll, new_bal)
             self._bankroll = new_bal

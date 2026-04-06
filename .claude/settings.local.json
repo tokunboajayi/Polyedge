@@ -25,7 +25,13 @@
       "Bash(py -3.13 -m pytest --version)",
       "Bash(py:*)",
       "Bash(python -m pytest tests/test_backup.py tests/test_daily_report.py tests/test_edge_erosion.py -v)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(set PYTHONIOENCODING=utf-8)",
+      "Bash(taskkill /F /IM python.exe /FI \"WINDOWTITLE eq *demo_trade*\")",
+      "Bash(tasklist)",
+      "Bash(findstr \"python\")",
+      "Bash(taskkill:*)",
+      "Bash(cmd:*)"
     ]
   }
 }

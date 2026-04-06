@@ -84,6 +84,106 @@ SUPPORTED_CATEGORIES: frozenset[str] = frozenset({
     "economics", "politics", "regulatory", "macro", "tech",
 })
 
+#: Maps Kalshi event-level category strings (from /events) to PolyEdge canonical.
+_EVENT_CATEGORY_MAP: dict[str, str] = {
+    "politics":               "politics",
+    "elections":              "politics",
+    "economics":              "economics",
+    "financials":             "economics",
+    "macro":                  "macro",
+    "crypto":                 "tech",
+    "science and technology": "tech",
+    "technology":             "tech",
+    "regulatory":             "regulatory",
+    "sports":                 "sports",
+    "entertainment":          "entertainment",
+}
+
+#: Series prefix → PolyEdge category (uppercase keys).
+_SERIES_PREFIX_CATEGORY: dict[str, str] = {
+    "KXWTI":     "macro",
+    "KXBRENT":   "macro",
+    "KXGAS":     "macro",
+    "KXGOLD":    "macro",
+    "KXSILVER":  "macro",
+    "KXDXY":     "macro",
+    "KXINX":     "economics",
+    "KXNDAQ":    "economics",
+    "KXDJI":     "economics",
+    "KXFED":     "economics",
+    "KXCPI":     "economics",
+    "KXPCE":     "economics",
+    "KXGDP":     "economics",
+    "KXUNEM":    "economics",
+    "KXPAYROLL": "economics",
+    "KXJOBS":    "economics",
+    "KXHOUSING": "economics",
+    "KXRETAIL":  "economics",
+    "INX":       "economics",
+    "INXD":      "economics",
+    "NASDAQ":    "economics",
+    "KXBTC":     "tech",
+    "KXETH":     "tech",
+    "KXSOL":     "tech",
+    "KXXRP":     "tech",
+    "KXDOGE":    "tech",
+    "KXBNB":     "tech",
+    "BTCUSD":    "tech",
+    "ETHUSD":    "tech",
+    "PRES":      "politics",
+    "KXTRUMP":   "politics",
+    "KXBIDEN":   "politics",
+    "KXHARRIS":  "politics",
+    "KXELECT":   "politics",
+    "KXGOV":     "politics",
+    "KXPOL":     "politics",
+    "CONGRESS":  "politics",
+    "SENATE":    "politics",
+    "HOUSE":     "politics",
+    "KXSEN":     "politics",
+    "KXREP":     "politics",
+    "KXPRIMARY": "politics",
+    "KXAPPROVAL":"politics",
+    "KXCFTC":    "regulatory",
+    "KXSEC":     "regulatory",
+    "KXREG":     "regulatory",
+    "KXFDA":     "regulatory",
+    "KXDOJ":     "regulatory",
+    # Sports (excluded) — must be listed so hash strings don't false-match keywords
+    "KXMVESPORTSMULTIGAMEEXTENDED": "sports",
+    "KXMVESPORTS": "sports",
+    "KXMVE":     "sports",
+    "KXMLB":     "sports",
+    "KXMLBHRR":  "sports",
+    "KXMLBTB":   "sports",
+    "KXMLBHIT":  "sports",
+    "KXMLBTOTAL":"sports",
+    "KXMLBHR":   "sports",
+    "KXMLBF5TOTAL": "sports",
+    "KXMLBSPREAD":  "sports",
+    "KXMLBTEAMTOTAL": "sports",
+    "KXNHL":     "sports",
+    "KXNHLGOAL": "sports",
+    "KXNHLFIRSTGOAL": "sports",
+    "KXNHLPTS":  "sports",
+    "KXNBA":     "sports",
+    "KXNBAREB":  "sports",
+    "KXNBA3PT":  "sports",
+    "KXNBAAST":  "sports",
+    "KXNBAPTS":  "sports",
+    "KXNFL":     "sports",
+    "KXNFLTOTAL":"sports",
+    "KXNFLSPREAD":"sports",
+    "KXSOCCER":  "sports",
+    "KXTENNIS":  "sports",
+    "KXGOLF":    "sports",
+    "KXQUICKSETTLE": "sports",
+    # Entertainment / other unsupported
+    "KXHYPE":    "entertainment",
+    "KXHYPED":   "entertainment",
+    "KXBNBD":    "tech",   # BNB Daily crypto
+}
+
 #: Any market whose Kalshi category normalises to one of these is auto-excluded.
 EXCLUDED_CATEGORIES: frozenset[str] = frozenset({
     "sports", "sport", "weather", "crypto", "cryptocurrency",
@@ -205,6 +305,7 @@ class MarketScanner:
         max_settlement_days:  int   = C.MAX_SETTLEMENT_DAYS,
         slippage_threshold:   float = C.MAX_EXIT_SLIPPAGE,
         min_liquidity:        float = MIN_LIQUIDITY_DOLLARS,
+        min_hours_to_settle:  float = 48.0,   # hard exclusion: < this many hours → skip
     ) -> None:
         """
         Args:
@@ -226,6 +327,7 @@ class MarketScanner:
         self._max_days            = max_settlement_days
         self._slippage_threshold  = slippage_threshold
         self._min_liquidity       = min_liquidity
+        self._min_hours_to_settle = min_hours_to_settle
 
     # ------------------------------------------------------------------
     # Public API
@@ -287,22 +389,22 @@ class MarketScanner:
         series_ticker = raw.get("series_ticker", "")
 
         raw_category = (raw.get("category") or "").strip()
-        category     = self._normalise_category(raw_category)
+        category     = self._normalise_category(raw_category, ticker, event_ticker)
 
-        yes_bid = _int_or_none(raw.get("yes_bid"))
-        yes_ask = _int_or_none(raw.get("yes_ask"))
-        no_bid  = _int_or_none(raw.get("no_bid"))
-        no_ask  = _int_or_none(raw.get("no_ask"))
+        yes_bid = _parse_price_cents(raw, "yes_bid")
+        yes_ask = _parse_price_cents(raw, "yes_ask")
+        no_bid  = _parse_price_cents(raw, "no_bid")
+        no_ask  = _parse_price_cents(raw, "no_ask")
 
         spread_cents = _compute_spread(yes_bid, yes_ask)
         mid_price    = _compute_mid(yes_bid, yes_ask)
 
         # Volume: try 7d field first, fall back to whatever is available;
         # if the field is in contracts, multiply by mid_price to estimate dollars.
-        volume_raw  = _first_float(raw, "volume_24h", "volume_7d", "volume_7day", "volume")
+        volume_raw  = _first_float(raw, "volume_24h_fp", "volume_24h", "volume_fp", "volume_7d", "volume_7day", "volume")
         volume_7d   = volume_raw * mid_price if volume_raw > 0 and mid_price > 0 else volume_raw
 
-        open_interest = int(raw.get("open_interest") or 0)
+        open_interest = int(float(raw.get("open_interest_fp") or raw.get("open_interest") or 0))
 
         close_time, days = self._parse_settlement(raw, now_utc)
 
@@ -360,8 +462,9 @@ class MarketScanner:
     ) -> list[str]:
         reasons: list[str] = []
 
-        # Settlement < 48 hours
-        if days is not None and days < 2.0:
+        # Settlement below hard minimum (configurable; default 48 h)
+        min_days_hard = self._min_hours_to_settle / 24.0
+        if days is not None and days < min_days_hard:
             reasons.append(f"settlement_too_soon:{days:.1f}d")
 
         # Excluded category
@@ -454,26 +557,30 @@ class MarketScanner:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _normalise_category(raw: str) -> str:
+    def _normalise_category(raw: str, ticker: str = "", event_ticker: str = "") -> str:
         """Map a Kalshi category string to a PolyEdge canonical category.
 
         Returns "unknown" for unrecognised categories, "excluded" for those
-        in EXCLUDED_CATEGORIES.
+        in EXCLUDED_CATEGORIES.  Falls back to ticker-prefix inference when
+        the API category field is empty (as it is on the live /markets endpoint).
         """
-        key = raw.lower().strip()
-        if key in EXCLUDED_CATEGORIES:
-            return "excluded"
-        if key in CATEGORY_MAP:
-            return CATEGORY_MAP[key]
-        # Partial match: if any map key is a substring of the raw category
-        for map_key, canonical in CATEGORY_MAP.items():
-            if map_key in key:
-                return canonical
-        # Partial match: if the raw category is a substring of any map key
-        for map_key, canonical in CATEGORY_MAP.items():
-            if key and key in map_key:
-                return canonical
-        return "unknown"
+        key = (raw or "").lower().strip()
+        if key:
+            if key in EXCLUDED_CATEGORIES:
+                return "excluded"
+            if key in _EVENT_CATEGORY_MAP:
+                cat = _EVENT_CATEGORY_MAP[key]
+                return "excluded" if cat in EXCLUDED_CATEGORIES else cat
+            if key in CATEGORY_MAP:
+                return CATEGORY_MAP[key]
+            for map_key, canonical in CATEGORY_MAP.items():
+                if map_key in key:
+                    return canonical
+            for map_key, canonical in CATEGORY_MAP.items():
+                if key in map_key:
+                    return canonical
+        # API category field was empty — infer from ticker prefix
+        return _category_from_ticker(ticker, event_ticker)
 
     @staticmethod
     def _parse_settlement(
@@ -534,6 +641,47 @@ class MarketScanner:
 # ---------------------------------------------------------------------------
 # Module-level pure functions (testable without a KalshiClient)
 # ---------------------------------------------------------------------------
+
+def _category_from_ticker(ticker: str, event_ticker: str) -> str:
+    """Infer PolyEdge category from ticker prefix when the API category is null."""
+    for candidate in (event_ticker or "", ticker or ""):
+        prefix = candidate.split("-")[0].upper().strip()
+        if prefix in _SERIES_PREFIX_CATEGORY:
+            return _SERIES_PREFIX_CATEGORY[prefix]
+    combined = f"{ticker} {event_ticker}".upper()
+    if any(k in combined for k in ("TRUMP", "BIDEN", "HARRIS", "ELECTION", "SENATE",
+                                    "HOUSE", "CONGRESS", "PRESIDENT", "GOVERNOR",
+                                    "PRES", "KXGOV", "KXSEN")):
+        return "politics"
+    if any(k in combined for k in ("BTC", "ETH", "CRYPTO", "SOL", "DOGE", "XRP")):
+        return "tech"
+    if any(k in combined for k in ("FED", "CPI", "GDP", "PAYROLL", "JOBS", "UNEM",
+                                    "RATE", "INFLATION", "INX", "SP500", "NASDAQ",
+                                    "DOW", "WTI", "OIL", "GOLD", "SILVER")):
+        return "economics"
+    if any(k in combined for k in ("CFTC", "SEC", "FDA", "DOJ", "REGULATION", "RULE")):
+        return "regulatory"
+    return "unknown"
+
+
+def _parse_price_cents(raw: dict[str, Any], field: str) -> int | None:
+    """Return a price as integer cents, handling both cents (int) and dollar (string float) formats."""
+    # Try dollar-string format first (new API: "yes_ask_dollars")
+    dollar_val = raw.get(f"{field}_dollars")
+    if dollar_val is not None:
+        try:
+            return round(float(dollar_val) * 100)
+        except (TypeError, ValueError):
+            pass
+    # Fall back to integer cents (old API)
+    cent_val = raw.get(field)
+    if cent_val is not None:
+        try:
+            return int(cent_val)
+        except (TypeError, ValueError):
+            pass
+    return None
+
 
 def _int_or_none(v: Any) -> int | None:
     try:
