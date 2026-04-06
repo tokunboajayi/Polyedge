@@ -273,8 +273,21 @@ async def _upsert_market(db, row: dict) -> None:
 # Main seeding logic
 # ---------------------------------------------------------------------------
 
-async def seed(target: int = 200, max_pages: int = 25, fetch_history: bool = True) -> int:
+async def seed(
+    target: int = 200,
+    max_pages: int = 50,
+    fetch_history: bool = True,
+    before_date: str = _DEFAULT_BEFORE_DATE,
+) -> int:
     """Fetch settled markets and populate the DB.
+
+    Args:
+        target:       Stop once this many supported-category markets are seeded.
+        max_pages:    Hard ceiling on paginated API requests.
+        fetch_history: Whether to fetch per-market price history.
+        before_date:  ISO date string (YYYY-MM-DD).  Only markets whose
+                      close_time < this date are fetched.  Defaults to
+                      2025-01-01 to skip the recent sports-parlay firehose.
 
     Returns the number of supported-category markets seeded.
     """
@@ -283,20 +296,32 @@ async def seed(target: int = 200, max_pages: int = 25, fetch_history: bool = Tru
     async with get_connection() as db:
         await _ensure_extra_columns(db)
 
+    # Convert before_date to a Unix timestamp for the API filter
+    try:
+        before_dt    = datetime.strptime(before_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        max_close_ts = int(before_dt.timestamp())
+    except ValueError:
+        logger.warning("Invalid --before-date %r — ignoring date filter", before_date)
+        max_close_ts = None
+
     now_str  = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     cursor   = None
     total_fetched    = 0
     total_supported  = 0
     total_skipped    = 0
+    total_sports     = 0
 
-    logger.info("Starting seed — target=%d supported markets, max_pages=%d", target, max_pages)
+    logger.info(
+        "Starting seed — target=%d  max_pages=%d  before=%s",
+        target, max_pages, before_date,
+    )
 
     for page_num in range(1, max_pages + 1):
         logger.info("Fetching page %d (supported so far: %d/%d) …",
                     page_num, total_supported, target)
 
         try:
-            markets, cursor = _fetch_settled_page(cursor)
+            markets, cursor = _fetch_settled_page(cursor, max_close_ts=max_close_ts)
         except requests.HTTPError as exc:
             logger.error("API error on page %d: %s", page_num, exc)
             break
@@ -312,6 +337,17 @@ async def seed(target: int = 200, max_pages: int = 25, fetch_history: bool = Tru
             batch_written = 0
 
             for raw in markets:
+                # ── Early-exit: skip known sports series without category lookup ──
+                series_ticker = raw.get("series_ticker", "") or ""
+                if any(series_ticker.upper().startswith(pfx) for pfx in _SPORTS_SERIES_PREFIXES):
+                    total_sports += 1
+                    continue
+
+                ticker_raw = raw.get("ticker", "") or ""
+                if any(ticker_raw.upper().startswith(pfx) for pfx in _SPORTS_SERIES_PREFIXES):
+                    total_sports += 1
+                    continue
+
                 category = _normalise_category(raw.get("category", ""))
                 if category not in SUPPORTED_CATEGORIES:
                     total_skipped += 1
