@@ -333,6 +333,23 @@ class MarketScanner:
     # Public API
     # ------------------------------------------------------------------
 
+    def get_raw_field_sample(self) -> list[dict]:
+        """Return raw price fields from first 5 markets for API schema diagnosis."""
+        raw_markets: list[dict[str, Any]] = self._client.get_markets(
+            status="open", fetch_all=False
+        )
+        sample = []
+        for raw in raw_markets[:5]:
+            ticker = raw.get("ticker", "")
+            sample.append({
+                "ticker":           ticker,
+                "yes_bid":          raw.get("yes_bid"),
+                "yes_ask":          raw.get("yes_ask"),
+                "yes_bid_dollars":  raw.get("yes_bid_dollars"),
+                "yes_ask_dollars":  raw.get("yes_ask_dollars"),
+            })
+        return sample
+
     def scan(self) -> ScanResult:
         """Fetch all open markets and return a ScanResult.
 
@@ -374,6 +391,12 @@ class MarketScanner:
             rejection_summary=reason_counts,
         )
 
+        if len(tradeable) == 0 and len(raw_markets) > 1000:
+            logger.warning(
+                "scan_zero_tradeable  fetched=%d  possible_api_schema_change=True  "
+                "check_raw_price_fields", len(raw_markets)
+            )
+
         self._log_result(result)
         return result
 
@@ -395,6 +418,13 @@ class MarketScanner:
         yes_ask = _parse_price_cents(raw, "yes_ask")
         no_bid  = _parse_price_cents(raw, "no_bid")
         no_ask  = _parse_price_cents(raw, "no_ask")
+
+        missing = sum(1 for v in [yes_bid, yes_ask, no_bid, no_ask] if v is None)
+        if missing > 0:
+            logger.debug(
+                "market_price_fields_missing  ticker=%s  missing=%d/4",
+                ticker, missing,
+            )
 
         spread_cents = _compute_spread(yes_bid, yes_ask)
         mid_price    = _compute_mid(yes_bid, yes_ask)
@@ -420,6 +450,7 @@ class MarketScanner:
                 self._entry_checks(
                     volume_7d, spread_cents, open_interest,
                     mid_price, days, category, raw,
+                    yes_bid=yes_bid, yes_ask=yes_ask,
                 )
             )
 
@@ -506,8 +537,20 @@ class MarketScanner:
         days:          float | None,
         category:      str,
         raw:           dict[str, Any],
+        yes_bid:       int | None = None,
+        yes_ask:       int | None = None,
     ) -> list[str]:
         reasons: list[str] = []
+
+        # Price validity — require real bid AND ask, both in 5c–95c range.
+        # Markets with 0 or null prices have no real liquidity and generate
+        # spurious 50pp edge signals based on the 0.50 mid-price fallback.
+        if not yes_bid or not yes_ask or yes_bid <= 0 or yes_ask <= 0:
+            reasons.append("no_price_data")
+            return reasons
+        if not (5 <= yes_ask <= 95) or not (5 <= yes_bid <= 95):
+            reasons.append(f"price_out_of_range:ask={yes_ask}c,bid={yes_bid}c")
+            return reasons
 
         # Volume
         if volume_7d < self._vol_threshold:
@@ -517,7 +560,8 @@ class MarketScanner:
 
         # Spread
         if spread_cents is None:
-            reasons.append("no_spread_data")
+            reasons.append("no_price_data")  # rename for clarity
+            return reasons  # early return — no point checking other entry criteria
         elif spread_cents > self._spread_threshold * 100:
             reasons.append(
                 f"wide_spread:{spread_cents:.1f}c>{self._spread_threshold*100:.0f}c"

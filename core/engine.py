@@ -120,6 +120,7 @@ from data.kalshi_client import KalshiClient
 from data.market_scanner import MarketScanner, ScannedMarket
 from data.regulatory_feeds import RegulatoryAlert, RegulatoryPoller
 from data.rss_aggregator import Headline, RssAggregator
+from monitoring.credit_monitor import CreditMonitor
 from monitoring.daily_report import DailyReporter
 from monitoring.edge_erosion import EdgeErosionMonitor
 from monitoring.slack_alerts import SlackAlerter
@@ -196,6 +197,7 @@ class Engine:
         self._sizer           = PositionSizer()
         self._correlation     = CorrelationManager()
         self._alerter         = SlackAlerter()
+        self._credit_monitor  = CreditMonitor(alerter=self._alerter)
         self._circuit_breaker = CircuitBreaker(slack_alerter=self._alerter)
         self._calibration     = CalibrationLoop(slack_alerter=self._alerter)
         self._edge_monitor    = EdgeErosionMonitor(slack_alerter=self._alerter)
@@ -251,6 +253,13 @@ class Engine:
         await init_db()
         await self._load_open_positions()
         await self._refresh_bankroll()
+
+        if not await self._credit_monitor.check_credits(
+            bankroll=self._bankroll,
+            open_positions=len(self._open_positions),
+        ):
+            logger.critical("startup_credit_check_failed — entering safe mode")
+            await self._enter_safe_mode("credits_exhausted")
 
         loop = asyncio.get_event_loop()
         try:
@@ -342,6 +351,43 @@ class Engine:
             logger.debug("safe_mode_active — skipping scan cycle")
             return
 
+        # ── Claude API availability ────────────────────────────────────
+        if self._analyzer is not None and self._analyzer.is_unavailable():
+            logger.critical("claude_unavailable — entering safe mode, no new trades")
+            await self._enter_safe_mode("claude_api_unavailable")
+            return
+
+        # ── Anthropic credit check (every 10 cycles) ──────────────────
+        if self._scan_cycle_count % BALANCE_REFRESH_CYCLES == 0:
+            if not await self._credit_monitor.check_credits(
+                bankroll=self._bankroll,
+                open_positions=len(self._open_positions),
+            ):
+                logger.critical(
+                    "credit_check_failed  cycle=%d — entering safe mode",
+                    self._scan_cycle_count,
+                )
+                await self._enter_safe_mode("credits_exhausted")
+                return
+
+        # ── Circuit breaker — refresh with latest P&L each cycle ─────
+        daily_pnl, weekly_pnl, monthly_pnl = await self._compute_pnl_windows()
+        cb_result = await self._circuit_breaker.update(
+            bankroll=self._bankroll,
+            daily_pnl=daily_pnl,
+            weekly_pnl=weekly_pnl,
+            monthly_pnl=monthly_pnl,
+            open_positions=len(self._open_positions),
+            starting_bankroll=S.STARTING_BANKROLL,
+        )
+        if cb_result.kill_switch:
+            logger.critical(
+                "kill_switch_triggered_on_scan_cycle  bankroll=%.2f",
+                self._bankroll,
+            )
+            self._shutdown_event.set()
+            return
+
         # ── Kill switch ────────────────────────────────────────────────
         if self._circuit_breaker.kill_switch_active():
             logger.critical("kill_switch_active — initiating shutdown")
@@ -390,6 +436,12 @@ class Engine:
             except Exception as exc:
                 logger.warning("signal_pipeline_error  ticker=%s  error=%s",
                                market.ticker, exc, exc_info=True)
+
+        # ── Post-pipeline Claude availability check ────────────────────
+        if self._analyzer is not None and self._analyzer.is_unavailable():
+            logger.critical("claude_unavailable — entering safe mode, no new trades")
+            await self._enter_safe_mode("claude_api_unavailable")
+            return
 
     # =========================================================================
     # Signal pipeline
@@ -1046,8 +1098,97 @@ class Engine:
                 dollar_size=row["num_contracts"] * float(row["entry_price"]),
             )
 
+        db_count = len(self._open_positions)
         if rows:
-            logger.info("loaded_open_positions  count=%d", len(rows))
+            logger.info("loaded_open_positions  count=%d", db_count)
+
+        # ── Reconcile against Kalshi live positions ────────────────────
+        now_utc = datetime.now(timezone.utc)
+        try:
+            kalshi_pos_list: list[dict] = await asyncio.to_thread(
+                functools.partial(self._client.get_positions, settlement_status="unsettled")
+            )
+        except Exception as exc:
+            logger.warning(
+                "position_reconciliation_failed  error=%s — skipping reconcile", exc
+            )
+            return
+
+        # Build a set of tickers Kalshi knows about (non-zero quantity)
+        kalshi_tickers: dict[str, dict] = {}
+        for kpos in kalshi_pos_list:
+            ticker = kpos.get("market_ticker") or kpos.get("ticker") or ""
+            qty = int(kpos.get("position") or kpos.get("quantity") or 0)
+            if ticker and qty != 0:
+                kalshi_tickers[ticker] = kpos
+
+        # Positions in Kalshi but missing from DB → recover them
+        for ticker, kpos in kalshi_tickers.items():
+            if ticker not in self._open_positions:
+                logger.warning(
+                    "position_reconciliation_gap  ticker=%s — in Kalshi but not in DB",
+                    ticker,
+                )
+                qty  = int(kpos.get("position") or kpos.get("quantity") or 1)
+                side = (kpos.get("side") or "YES").upper()
+                direction = "buy_yes" if side == "YES" else "buy_no"
+                # Use average cost as entry price; fall back to 0.50 if absent
+                avg_price = float(
+                    kpos.get("average_price") or kpos.get("cost", 0) or 0
+                )
+                if avg_price > 1.0:          # cents → dollars
+                    avg_price = avg_price / 100.0
+                if avg_price <= 0:
+                    avg_price = 0.50
+
+                pos = OpenPosition(
+                    trade_id=-1,             # no DB row; sentinel value
+                    ticker=ticker,
+                    strategy="unknown_recovered",
+                    direction=direction,
+                    side=side,
+                    num_contracts=qty,
+                    entry_price=avg_price,
+                    model_prob=avg_price,
+                    target_price=min(0.99, avg_price + 0.10),
+                    stop_price=max(0.01, avg_price - 0.10),
+                    category="unknown",
+                    entry_time=now_utc,
+                    order_id="",
+                )
+                self._open_positions[ticker] = pos
+                self._correlation.add_position(
+                    ticker=ticker,
+                    category="unknown",
+                    direction=direction,
+                    dollar_size=qty * avg_price,
+                )
+                self._alerter.system_info(
+                    "Position reconciliation gap — recovered from Kalshi",
+                    {
+                        "Ticker":      ticker,
+                        "Contracts":   str(qty),
+                        "Side":        side,
+                        "Avg price":   f"${avg_price:.2f}",
+                        "Note":        "Not found in DB; recovered from live portfolio",
+                    },
+                    bankroll=self._bankroll,
+                    open_positions=len(self._open_positions),
+                )
+
+        # Positions in DB but gone from Kalshi → remove ghosts
+        for ticker in list(self._open_positions.keys()):
+            if ticker not in kalshi_tickers:
+                logger.warning(
+                    "position_ghost  ticker=%s — in DB but not in Kalshi, removing",
+                    ticker,
+                )
+                del self._open_positions[ticker]
+
+        logger.info(
+            "positions_reconciled  db_count=%d  kalshi_count=%d  final=%d",
+            db_count, len(kalshi_tickers), len(self._open_positions),
+        )
 
     async def _graceful_shutdown(self) -> None:
         """Close all open positions and send a final status message."""
@@ -1081,8 +1222,15 @@ class Engine:
     # Utility helpers
     # =========================================================================
 
+    async def _compute_pnl_windows(self) -> tuple[float, float, float]:
+        """Return (daily_pnl, weekly_pnl, monthly_pnl) from closed/settled trades."""
+        daily   = await self._fetch_period_pnl(hours=24)
+        weekly  = await self._fetch_period_pnl(hours=24 * 7)
+        monthly = await self._fetch_period_pnl(hours=24 * 30)
+        return daily, weekly, monthly
+
     async def _refresh_bankroll(self) -> None:
-        """Fetch current production account balance."""
+        """Fetch current production account balance and update circuit breaker."""
         try:
             balance_data = await asyncio.to_thread(self._client.get_balance)
             new_bal = float(balance_data.get("balance", self._bankroll))
@@ -1093,6 +1241,24 @@ class Engine:
         except Exception as exc:
             logger.warning("balance_fetch_failed  error=%s  using_cached=$%.2f",
                            exc, self._bankroll)
+            return
+
+        daily_pnl, weekly_pnl, monthly_pnl = await self._compute_pnl_windows()
+        result = await self._circuit_breaker.update(
+            bankroll=self._bankroll,
+            daily_pnl=daily_pnl,
+            weekly_pnl=weekly_pnl,
+            monthly_pnl=monthly_pnl,
+            open_positions=len(self._open_positions),
+            starting_bankroll=S.STARTING_BANKROLL,
+        )
+        if result.kill_switch:
+            logger.critical(
+                "kill_switch_triggered_on_balance_refresh  bankroll=%.2f",
+                self._bankroll,
+            )
+            self._shutdown_event.set()
+            return
 
     async def _place_entry_order(
         self,
@@ -1168,6 +1334,8 @@ class Engine:
             failed_services.append("kalshi_api")
         if "scan" in reason.lower():
             failed_services.append("market_scanner")
+        if "claude" in reason.lower():
+            failed_services.append("claude_api")
         if not failed_services:
             failed_services = ["unknown"]
 

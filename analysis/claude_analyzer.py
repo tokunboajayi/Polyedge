@@ -375,6 +375,9 @@ class ClaudeAnalyzer:
         result = await analyzer.decision_mode(ctx)
     """
 
+    _consecutive_api_failures: int = 0
+    _api_unavailable: bool = False
+
     def __init__(self, api_key: str | None = None) -> None:
         from config import settings as S
         self._client = anthropic.AsyncAnthropic(
@@ -382,6 +385,9 @@ class ClaudeAnalyzer:
         )
         # Per-ticker caches: "scan:{ticker}" and "decision:{ticker}"
         self._cache: dict[str, _CacheEntry] = {}
+
+        self._consecutive_api_failures: int = 0
+        self._api_unavailable: bool = False
 
         logger.info(
             "ClaudeAnalyzer ready  scan_model=%s  decision_model=%s",
@@ -401,7 +407,7 @@ class ClaudeAnalyzer:
         cache_key = f"scan:{ctx.market_ticker}"
 
         try:
-            raw, input_tok, output_tok, latency = await self._call_claude(
+            result_tuple = await self._call_claude(
                 model=C.CLAUDE_SCAN_MODEL,
                 system=system,
                 user=user,
@@ -415,6 +421,11 @@ class ClaudeAnalyzer:
                 ctx.market_ticker, exc, cache_key in self._cache,
             )
             return self._get_cached(cache_key, _SCAN_DEFAULT)  # type: ignore[return-value]
+
+        if result_tuple is None:
+            return self._get_cached(cache_key, _SCAN_DEFAULT)  # type: ignore[return-value]
+
+        raw, input_tok, output_tok, latency = result_tuple
 
         data = _extract_json(raw)
         result = ScanResult(
@@ -442,7 +453,7 @@ class ClaudeAnalyzer:
         cache_key = f"decision:{ctx.market_ticker}"
 
         try:
-            raw, input_tok, output_tok, latency = await self._call_claude(
+            result_tuple = await self._call_claude(
                 model=C.CLAUDE_DECISION_MODEL,
                 system=system,
                 user=user,
@@ -456,6 +467,11 @@ class ClaudeAnalyzer:
                 ctx.market_ticker, exc, cache_key in self._cache,
             )
             return self._get_cached(cache_key, _DECISION_DEFAULT)  # type: ignore[return-value]
+
+        if result_tuple is None:
+            return self._get_cached(cache_key, _DECISION_DEFAULT)  # type: ignore[return-value]
+
+        raw, input_tok, output_tok, latency = result_tuple
 
         data = _extract_json(raw)
         prob = float(max(0.0, min(1.0, data.get("predicted_probability", 0.5))))
@@ -490,11 +506,12 @@ class ClaudeAnalyzer:
         purpose:   str,
         ticker:    str,
         max_tokens: int = 256,
-    ) -> tuple[str, int, int, int]:
+    ) -> tuple[str, int, int, int] | None:
         """Call the Anthropic API with up to 2 retries.
 
-        Returns (response_text, input_tokens, output_tokens, latency_ms).
-        Raises the last exception if all attempts fail.
+        Returns (response_text, input_tokens, output_tokens, latency_ms) on
+        success.  Returns None (never raises) if all attempts fail — sets the
+        _api_unavailable flag and logs CRITICAL.
         """
         last_exc: Exception | None = None
 
@@ -529,6 +546,7 @@ class ClaudeAnalyzer:
                     model, input_tokens, output_tokens, cost, purpose, ticker
                 )
 
+                self.reset_availability()
                 return content, input_tokens, output_tokens, latency_ms
 
             except asyncio.TimeoutError as exc:
@@ -556,7 +574,14 @@ class ClaudeAnalyzer:
             if attempt < 2:
                 await asyncio.sleep(wait)
 
-        raise last_exc  # type: ignore[misc]
+        self._consecutive_api_failures += 1
+        self._api_unavailable = True
+        logger.critical(
+            "claude_api_unavailable  model=%s  purpose=%s  ticker=%s  "
+            "consecutive_failures=%d — returning safe default, no new trades",
+            model, purpose, ticker, self._consecutive_api_failures,
+        )
+        return None
 
     # ------------------------------------------------------------------
     # Internal — DB cost logging
@@ -616,6 +641,15 @@ class ClaudeAnalyzer:
     # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------
+
+    def is_unavailable(self) -> bool:
+        """Return True when the Claude API has been flagged as unavailable."""
+        return self._api_unavailable
+
+    def reset_availability(self) -> None:
+        """Reset failure tracking after a successful API call."""
+        self._consecutive_api_failures = 0
+        self._api_unavailable = False
 
     def cache_keys(self) -> list[str]:
         return list(self._cache.keys())

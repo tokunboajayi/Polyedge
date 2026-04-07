@@ -31,7 +31,9 @@
       "Bash(tasklist)",
       "Bash(findstr \"python\")",
       "Bash(taskkill:*)",
-      "Bash(cmd:*)"
+      "Bash(cmd:*)",
+      "Bash(tasklist:*)",
+      "Bash(tasklist.exe:*)"
     ]
   }
 }

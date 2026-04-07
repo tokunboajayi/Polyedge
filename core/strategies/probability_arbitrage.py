@@ -123,6 +123,18 @@ class StrategyA:
         Returns:
             Signal if the gate is passed, None otherwise.
         """
+        # Gate 0 — market must have real pricing (5c–95c); 0-priced markets
+        # produce spurious 50pp edge because mid_price falls back to 0.50.
+        entry_check = market.mid_price if hasattr(market, "market_price") \
+            else market.mid_price
+        ask = market.yes_ask  # cents; None or 0 means unpriced
+        if not ask or ask <= 0 or not (5 <= ask <= 95):
+            logger.debug(
+                "strategy_a_skip  ticker=%s  reason=unpriced  yes_ask=%s",
+                market.ticker, ask,
+            )
+            return None
+
         # Gate 1 — probability model must consider action eligible
         if not estimate.action_eligible:
             logger.debug(

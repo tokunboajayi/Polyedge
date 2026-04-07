@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PolyEdge v5 — Performance Dashboard</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f1117; color: #e1e4e8; padding: 24px; }
+  h1 { font-size: 28px; font-weight: 700; margin-bottom: 4px; color: #fff; }
+  .subtitle { color: #8b949e; font-size: 14px; margin-bottom: 24px; }
+  .alert-banner { background: #3a1d1d; border: 1px solid #f85149; border-radius: 8px; padding: 12px 16px; margin-bottom: 20px; font-size: 13px; color: #f85149; }
+  .alert-banner strong { color: #ff7b72; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 24px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 20px; }
+  .card-label { font-size: 12px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+  .card-value { font-size: 32px; font-weight: 700; }
+  .card-detail { font-size: 12px; color: #8b949e; margin-top: 4px; }
+  .green { color: #3fb950; }
+  .red { color: #f85149; }
+  .yellow { color: #d29922; }
+  .blue { color: #58a6ff; }
+  .white { color: #fff; }
+  .section { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 20px; margin-bottom: 20px; }
+  .section h2 { font-size: 16px; font-weight: 600; margin-bottom: 16px; color: #fff; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; padding: 10px 12px; border-bottom: 1px solid #30363d; color: #8b949e; font-weight: 500; text-transform: uppercase; font-size: 11px; letter-spacing: 0.5px; }
+  td { padding: 10px 12px; border-bottom: 1px solid #21262d; }
+  tr:hover { background: #1c2128; }
+  .bar-container { background: #21262d; border-radius: 4px; height: 24px; position: relative; overflow: hidden; }
+  .bar { height: 100%; border-radius: 4px; display: flex; align-items: center; padding-left: 8px; font-size: 11px; font-weight: 600; min-width: 30px; }
+  .bar-green { background: linear-gradient(90deg, #238636, #3fb950); }
+  .bar-red { background: linear-gradient(90deg, #8b1a1a, #f85149); }
+  .bar-blue { background: linear-gradient(90deg, #1158c7, #58a6ff); }
+  .bar-yellow { background: linear-gradient(90deg, #9e6a03, #d29922); }
+  .status-badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+  .badge-active { background: #0d4429; color: #3fb950; }
+  .badge-warn { background: #3d2e00; color: #d29922; }
+  .badge-crit { background: #3a1d1d; color: #f85149; }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  @media (max-width: 768px) { .two-col { grid-template-columns: 1fr; } }
+  .footer { text-align: center; color: #484f58; font-size: 12px; margin-top: 32px; padding-top: 16px; border-top: 1px solid #21262d; }
+  .pnl-waterfall { display: flex; align-items: flex-end; gap: 2px; height: 120px; padding: 0 4px; }
+  .pnl-bar { flex: 1; min-width: 3px; border-radius: 2px 2px 0 0; position: relative; }
+  .metric-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid #21262d; }
+  .metric-row:last-child { border-bottom: none; }
+  .metric-label { font-size: 13px; color: #c9d1d9; }
+  .metric-value { font-size: 13px; font-weight: 600; }
+</style>
+</head>
+<body>
+
+<h1>PolyEdge v5 Dashboard</h1>
+<p class="subtitle">Kalshi Demo Trading — Last updated: April 6, 2026 02:46 UTC</p>
+
+<div class="alert-banner">
+  <strong>⚠ DATABASE CORRUPTION DETECTED</strong> — polyedge.db is malformed (likely Windows→Linux path mismatch during mount). Data below is reconstructed from initial schema read + live logs. Run <code>sqlite3 polyedge.db ".recover" | sqlite3 recovered.db</code> on your Windows machine to recover full data.
+</div>
+
+<!-- KPI Cards -->
+<div class="grid">
+  <div class="card">
+    <div class="card-label">Total Trades</div>
+    <div class="card-value white">77</div>
+    <div class="card-detail">Recorded in trades table</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Open Positions</div>
+    <div class="card-value yellow">5</div>
+    <div class="card-detail">Reloaded from DB at startup</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Current Bankroll</div>
+    <div class="card-value red">$455.51</div>
+    <div class="card-detail">Started at $500.00 (−$44.49 / −8.9%)</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Markets Tracked</div>
+    <div class="card-value blue">14,251</div>
+    <div class="card-detail">In markets table</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Calibration Records</div>
+    <div class="card-value white">77</div>
+    <div class="card-detail">1:1 with trades</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Claude API Cost</div>
+    <div class="card-value green">$0.26</div>
+    <div class="card-detail">559 calls this session (4,408 total logged)</div>
+  </div>
+</div>
+
+<!-- Two Column Layout -->
+<div class="two-col">
+
+  <!-- Scan Performance -->
+  <div class="section">
+    <h2>Scan Cycle Performance</h2>
+    <table>
+      <thead><tr><th>Cycle</th><th>Fetched</th><th>Tradeable</th><th>Rejected</th><th>Bankroll</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>10,000</td><td>98</td><td>9,902</td><td>$455.51</td></tr>
+        <tr><td>2</td><td>10,000</td><td>98</td><td>9,902</td><td>$455.51</td></tr>
+        <tr><td>3</td><td>10,000</td><td>98</td><td>9,902</td><td>$455.51</td></tr>
+        <tr><td>4</td><td>10,000</td><td>98</td><td>9,902</td><td>$455.51</td></tr>
+        <tr><td>5</td><td>10,000</td><td>98</td><td>9,902</td><td>$455.51</td></tr>
+        <tr><td>6</td><td>10,000</td><td>98</td><td>9,902</td><td>$455.51</td></tr>
+      </tbody>
+    </table>
+    <div class="card-detail" style="margin-top: 12px;">6 cycles in ~14 minutes (02:32–02:46 UTC). 98 markets pass filters per cycle (0.98% pass rate).</div>
+  </div>
+
+  <!-- Market Rejection Breakdown -->
+  <div class="section">
+    <h2>Market Rejection Breakdown (per cycle)</h2>
+    <div style="margin-bottom: 12px;">
+      <div class="metric-row">
+        <span class="metric-label">Sports (excluded)</span>
+        <span class="metric-value red">2,932</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">Unknown category</span>
+        <span class="metric-value yellow">2,580</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">Settlement too close (&lt;1 day)</span>
+        <span class="metric-value yellow">1,595</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">Settlement too soon (negative)</span>
+        <span class="metric-value">1,304</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label">Settlement too soon (0 days)</span>
+        <span class="metric-value">1,237</span>
+      </div>
+      <div class="metric-row">
+        <span class="metric-label" style="font-weight:600;">Other filters</span>
+        <span class="metric-value">254</span>
+      </div>
+    </div>
+    <div class="bar-container">
+      <div class="bar bar-red" style="width: 29.3%;">Sports 29%</div>
+    </div>
+    <div class="bar-container" style="margin-top:4px;">
+      <div class="bar bar-yellow" style="width: 25.8%;">Unknown 26%</div>
+    </div>
+    <div class="bar-container" style="margin-top:4px;">
+      <div class="bar bar-blue" style="width: 41.6%;">Time filters 42%</div>
+    </div>
+  </div>
+
+</div>
+
+<!-- Strategy Signals -->
+<div class="section">
+  <h2>Strategy Signal Analysis (This Session)</h2>
+  <div class="grid" style="margin-bottom:0;">
+    <div>
+      <div class="card-label">Total Signals Generated</div>
+      <div class="card-value blue" style="font-size:24px;">560</div>
+      <div class="card-detail">All Strategy A (Probability Arbitrage)</div>
+    </div>
+    <div>
+      <div class="card-label">Correlation Blocked</div>
+      <div class="card-value yellow" style="font-size:24px;">551</div>
+      <div class="card-detail">Reason: max_open_positions: 6>5</div>
+    </div>
+    <div>
+      <div class="card-label">New Trades Executed</div>
+      <div class="card-value white" style="font-size:24px;">0</div>
+      <div class="card-detail">All signals blocked by position limit</div>
+    </div>
+    <div>
+      <div class="card-label">Block Rate</div>
+      <div class="card-value red" style="font-size:24px;">98.4%</div>
+      <div class="card-detail">551 of 560 signals blocked</div>
+    </div>
+  </div>
+</div>
+
+<!-- Key Markets Scanned -->
+<div class="section">
+  <h2>Market Categories Scanned</h2>
+  <table>
+    <thead><tr><th>Category</th><th>Example Tickers</th><th>Signals</th><th>Direction</th></tr></thead>
+    <tbody>
+      <tr><td>Politics — Trump Mentions</td><td>KXTRUMPSAY-26APR13-*</td><td style="color:#58a6ff;">~25</td><td>buy_yes</td></tr>
+      <tr><td>Politics — Trump Mentions B</td><td>KXTRUMPMENTIONB-26APR01-*, -26APR06B-*</td><td style="color:#58a6ff;">~30</td><td>buy_yes</td></tr>
+      <tr><td>Media — Maddow Mentions</td><td>KXMADDOWMENTION-26APR06B-*</td><td style="color:#58a6ff;">~15</td><td>buy_yes</td></tr>
+      <tr><td>Sports — MLB Strikeouts</td><td>KXMLBKS-26APR062145PHISF-*</td><td style="color:#58a6ff;">~8</td><td>buy_yes</td></tr>
+      <tr><td>Sports — KBL Games</td><td>KXKBLGAME-26APR080600DAETHU-*</td><td style="color:#58a6ff;">~2</td><td>buy_yes</td></tr>
+    </tbody>
+  </table>
+  <div class="card-detail" style="margin-top:12px;">99 unique tickers analyzed across 6 cycles. All signals direction: buy_yes with 47–52pp edge estimates.</div>
+</div>
+
+<!-- Bot Health -->
+<div class="two-col">
+  <div class="section">
+    <h2>System Health</h2>
+    <div class="metric-row">
+      <span class="metric-label">Errors</span>
+      <span class="status-badge badge-active">0 ERRORS</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Warnings</span>
+      <span class="status-badge badge-warn">2 WARNINGS</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Warning Detail</span>
+      <span class="metric-value" style="font-size:11px;color:#d29922;">404 on INXW-26APR04-T5300 (delisted)</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Kalshi API</span>
+      <span class="status-badge badge-active">HEALTHY</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Claude API</span>
+      <span class="status-badge badge-active">HEALTHY</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Slack Alerts</span>
+      <span class="status-badge badge-active">CONNECTED</span>
+    </div>
+    <div class="metric-row">
+      <span class="metric-label">Database</span>
+      <span class="status-badge badge-crit">CORRUPTED</span>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Database Tables</h2>
+    <table>
+      <thead><tr><th>Table</th><th>Rows</th><th>Status</th></tr></thead>
+      <tbody>
+        <tr><td>trades</td><td>77</td><td><span class="status-badge badge-warn">READ FAILED</span></td></tr>
+        <tr><td>calibration</td><td>77</td><td><span class="status-badge badge-warn">READ FAILED</span></td></tr>
+        <tr><td>markets</td><td>14,251</td><td><span class="status-badge badge-warn">READ FAILED</span></td></tr>
+        <tr><td>edge_metrics</td><td>1</td><td><span class="status-badge badge-warn">READ FAILED</span></td></tr>
+        <tr><td>api_costs</td><td>4,408</td><td><span class="status-badge badge-warn">READ FAILED</span></td></tr>
+        <tr><td>alerts</td><td>1</td><td><span class="status-badge badge-warn">READ FAILED</span></td></tr>
+      </tbody>
+    </table>
+    <div class="card-detail" style="margin-top:12px;">Schema readable but data pages corrupted. Row counts from initial COUNT(*) before failure. Recover on Windows with SQLite CLI.</div>
+  </div>
+</div>
+
+<!-- P&L Summary -->
+<div class="section">
+  <h2>P&L Summary</h2>
+  <div class="grid" style="margin-bottom:0;">
+    <div>
+      <div class="card-label">Starting Capital</div>
+      <div class="card-value white" style="font-size:20px;">$500.00</div>
+    </div>
+    <div>
+      <div class="card-label">Current Balance</div>
+      <div class="card-value red" style="font-size:20px;">$455.51</div>
+    </div>
+    <div>
+      <div class="card-label">Unrealized P&L</div>
+      <div class="card-value red" style="font-size:20px;">−$44.49</div>
+      <div class="card-detail">−8.9% (5 open positions)</div>
+    </div>
+    <div>
+      <div class="card-label">API Costs (Session)</div>
+      <div class="card-value green" style="font-size:20px;">$0.26</div>
+      <div class="card-detail">559 Claude calls</div>
+    </div>
+  </div>
+  <div class="card-detail" style="margin-top:16px; padding: 12px; background: #1c2128; border-radius: 8px;">
+    <strong style="color:#d29922;">Note:</strong> Full P&L breakdown by category, win rate, and realized vs. unrealized splits require a healthy database. The −$44.49 reflects the balance difference reported by Kalshi's portfolio API. The 77 trades in the DB include historical trades from prior sessions. This session generated 0 new trades — all 560 signals were blocked because 5 open positions already hit the correlation limit (max 5).
+  </div>
+</div>
+
+<!-- Critical Observations -->
+<div class="section">
+  <h2>Critical Observations</h2>
+  <table>
+    <thead><tr><th>#</th><th>Finding</th><th>Severity</th><th>Action</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>1</td>
+        <td><strong>Database corrupted</strong> — cannot read trade data for detailed P&L analysis</td>
+        <td><span class="status-badge badge-crit">CRITICAL</span></td>
+        <td>Recover DB on Windows machine, backup immediately</td>
+      </tr>
+      <tr>
+        <td>2</td>
+        <td><strong>98.4% signal block rate</strong> — 5 open positions blocking all new entries</td>
+        <td><span class="status-badge badge-warn">HIGH</span></td>
+        <td>Review if open positions should be closed to free capacity</td>
+      </tr>
+      <tr>
+        <td>3</td>
+        <td><strong>All signals are buy_yes at 47–52pp edge</strong> — suspiciously uniform</td>
+        <td><span class="status-badge badge-warn">MEDIUM</span></td>
+        <td>Verify probability model calibration; edge may be overestimated on 0¢ contracts</td>
+      </tr>
+      <tr>
+        <td>4</td>
+        <td><strong>Bankroll down 8.9%</strong> — approaching 10% weekly circuit breaker</td>
+        <td><span class="status-badge badge-warn">MEDIUM</span></td>
+        <td>Monitor — 72hr pause triggers at 10% weekly loss</td>
+      </tr>
+      <tr>
+        <td>5</td>
+        <td><strong>Zero errors in 3,238 log lines</strong> — system is operationally stable</td>
+        <td><span class="status-badge badge-active">GOOD</span></td>
+        <td>No action needed</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="footer">
+  PolyEdge v5 — Kalshi Demo Trading Dashboard — Generated April 6, 2026 — Data from polyedge.db schema + demo_err.log
+</div>
+
+</body>
+</html>

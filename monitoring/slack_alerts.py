@@ -592,6 +592,32 @@ class SlackAlerter:
         )
 
     # ------------------------------------------------------------------
+    # Credit exhaustion alert → #alerts channel
+    # ------------------------------------------------------------------
+
+    def credits_exhausted(
+        self,
+        bankroll:       float,
+        open_positions: int,
+    ) -> bool:
+        """Alert that Anthropic API credits are exhausted — trading halted."""
+        return self._send(
+            channel="alerts",
+            level="critical",
+            title="ANTHROPIC CREDITS EXHAUSTED",
+            fields={
+                "Status":  "Trading halted — no new positions will be opened",
+                "Reason":  "Anthropic API returned a credit/quota exhaustion error",
+            },
+            action=(
+                "Top up credits at console.anthropic.com — "
+                "no new trades until resolved."
+            ),
+            bankroll=bankroll,
+            open_positions=open_positions,
+        )
+
+    # ------------------------------------------------------------------
     # Regulatory alert → #alerts channel
     # ------------------------------------------------------------------
 

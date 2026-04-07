@@ -53,6 +53,11 @@ MAX_CORRELATED_EXPOSURE: float = 0.30     # 30% in same category/direction
 MAX_TRADE_SIZE_MICRO_LIVE: float = 10.00  # $10 hard cap during micro-live phase
 
 # ---------------------------------------------------------------------------
+# Starting bankroll (default; overridden by STARTING_BANKROLL env var via settings)
+# ---------------------------------------------------------------------------
+STARTING_BANKROLL: float = 500.0
+
+# ---------------------------------------------------------------------------
 # Kill switch
 # ---------------------------------------------------------------------------
 KILL_SWITCH: float = 300.0   # Close all and halt when bankroll drops to $300
