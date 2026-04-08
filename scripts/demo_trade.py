@@ -94,7 +94,7 @@ from core.signals.news_catalyst import NewsCatalyst
 from core.signals.orderbook_confirm import OrderbookConfirm
 from core.strategies.mean_reversion import PricePoint, StrategyB, detect_spike
 from core.strategies.probability_arbitrage import StrategyA
-from data.kalshi_client import KalshiClient
+from data.kalshi_client import KalshiClient, LiveMarketClient
 from data.market_scanner import MarketScanner, ScannedMarket
 from monitoring.daily_report import DailyReporter
 from monitoring.edge_erosion import EdgeErosionMonitor
@@ -103,12 +103,21 @@ from persistence.backup import BackupManager
 from persistence.database import get_connection, init_db
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging — dual output: console + persistent log file
 # ---------------------------------------------------------------------------
+_LOG_FMT  = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s"
+_LOG_DATE = "%Y-%m-%dT%H:%M:%SZ"
+_LOG_FILE = _REPO_ROOT / "logs" / "demo_err.log"
+_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%SZ",
+    format=_LOG_FMT,
+    datefmt=_LOG_DATE,
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(str(_LOG_FILE), mode="a", encoding="utf-8"),
+    ],
 )
 logger = logging.getLogger("demo_trade")
 
@@ -160,18 +169,30 @@ class DemoTrader:
         self,
         duration_days: int = 30,
         dry_run:       bool = False,
+        live_markets:  bool = False,
     ) -> None:
         self._duration       = timedelta(days=duration_days)
         self._dry_run        = dry_run
+        self._live_markets   = live_markets
         self._start_time:    datetime | None = None
         self._shutdown_event = asyncio.Event()
 
         # ---------- Subsystems ----------
-        self._client          = KalshiClient()          # demo base URL from settings
+        # Execution client — always demo; places paper orders against demo balance.
+        self._client = KalshiClient()
+
+        # Market-data client — live API when --live-markets, demo otherwise.
+        # MarketScanner, orderbook lookups, and price reads all use this client.
+        # Order placement, balance, and positions always use self._client (demo).
+        if live_markets:
+            self._market_client: KalshiClient | LiveMarketClient = LiveMarketClient()
+        else:
+            self._market_client = self._client
+
         # Demo env: no real trading activity → relax volume/liquidity/settlement gates
         _is_demo = S.KALSHI_ENV == "demo"
         self._scanner         = MarketScanner(
-            self._client,
+            self._market_client,
             volume_threshold=0.0    if _is_demo else C.MIN_MARKET_VOLUME_7D,
             min_liquidity=0.0       if _is_demo else 1_000.0,
             min_settlement_days=1   if _is_demo else C.MIN_SETTLEMENT_DAYS,
@@ -226,6 +247,11 @@ class DemoTrader:
         logger.info("  Duration: %d days  |  Start: %s",
                     self._duration.days, self._start_time.strftime("%Y-%m-%dT%H:%MZ"))
         logger.info("---------------------------------------------")
+
+        if self._live_markets:
+            logger.info(
+                "market_data_source=live  execution_env=demo  orders_are_paper=True"
+            )
 
         if S.KALSHI_ENV != "demo":
             logger.critical(
@@ -442,7 +468,7 @@ class DemoTrader:
         # ── 6. Orderbook confirmation ─────────────────────────────────
         try:
             ob = await asyncio.to_thread(
-                self._client.get_orderbook, ticker, 5
+                self._market_client.get_orderbook, ticker, 5
             )
         except Exception as exc:
             logger.warning("orderbook_fetch_failed  ticker=%s  error=%s", ticker, exc)
@@ -591,13 +617,13 @@ class DemoTrader:
             ticker=ticker,
             category=category,
             direction=signal.direction,
-            dollar_size=size.dollar_size,
+            dollar_size=actual_dollar_size,
         )
 
         logger.info(
             "trade_opened  ticker=%s  strategy=%s  dir=%s  contracts=%d  "
             "price=%.3f  fees=$%.4f  edge=%.1fpp  trade_id=%d",
-            ticker, signal.strategy, signal.direction, size.num_contracts,
+            ticker, signal.strategy, signal.direction, actual_contracts,
             executed_price, fees, signal.net_edge_pp, trade_id,
         )
 
@@ -606,7 +632,7 @@ class DemoTrader:
             ticker=ticker,
             side=side.lower(),
             action="buy",
-            contracts=size.num_contracts,
+            contracts=actual_contracts,
             price=executed_price,
             fees=fees,
             strategy=signal.strategy,
@@ -639,14 +665,17 @@ class DemoTrader:
 
         for ticker, pos in list(self._open_positions.items()):
             try:
-                raw = await asyncio.to_thread(self._client.get_market, ticker)
+                raw = await asyncio.to_thread(self._market_client.get_market, ticker)
             except Exception as exc:
                 logger.warning("market_fetch_failed  ticker=%s  error=%s", ticker, exc)
                 continue
 
             market_status = raw.get("status", "")
-            yes_ask       = raw.get("yes_ask") or 0
-            yes_bid       = raw.get("yes_bid") or 0
+            from data.market_scanner import _parse_price_cents
+            yes_ask       = _parse_price_cents(raw, "yes_ask") or 0
+            yes_bid       = _parse_price_cents(raw, "yes_bid") or 0
+            if not yes_ask or not yes_bid:
+                continue
             current_yes   = (yes_ask + yes_bid) / 200.0   # mid-price in dollars
             close_time    = raw.get("close_time") or raw.get("expiration_time") or ""
 
@@ -975,9 +1004,11 @@ class DemoTrader:
 
         for ticker in list(self._open_positions.keys()):
             try:
-                raw = await asyncio.to_thread(self._client.get_market, ticker)
-                yes_ask = raw.get("yes_ask") or 0
-                yes_bid = raw.get("yes_bid") or 0
+                raw = await asyncio.to_thread(self._market_client.get_market, ticker)
+                from data.market_scanner import _parse_price_cents
+                yes_ask = _parse_price_cents(raw, "yes_ask") or 0
+                yes_bid = _parse_price_cents(raw, "yes_bid") or 0
+                if not yes_ask or not yes_bid: continue
                 current = (yes_ask + yes_bid) / 200.0
                 await self._close_position(ticker, current, "shutdown")
             except Exception as exc:
@@ -1013,6 +1044,16 @@ class DemoTrader:
             if new_bal != self._bankroll:
                 logger.info("bankroll_updated  old=$%.2f  new=$%.2f", self._bankroll, new_bal)
             self._bankroll = new_bal
+            # In demo mode, adjust the kill switch floor proportionally to
+            # actual balance so a partially-used demo wallet isn't immediately
+            # halted.  Production keeps the absolute $300 floor.
+            if S.KALSHI_ENV == "demo" and new_bal < C.KILL_SWITCH:
+                demo_floor = round(new_bal * 0.40, 2)
+                C.KILL_SWITCH = demo_floor
+                logger.info(
+                    "demo_kill_switch_adjusted  balance=$%.2f  new_floor=$%.2f",
+                    new_bal, demo_floor,
+                )
         except Exception as exc:
             logger.warning("balance_fetch_failed  error=%s  using_cached=$%.2f",
                            exc, self._bankroll)
@@ -1196,6 +1237,14 @@ def _parse_args() -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Root log level (default INFO).",
     )
+    p.add_argument(
+        "--live-markets", action="store_true",
+        help=(
+            "Fetch market/price data from the live Kalshi API (real bid/ask prices) "
+            "while keeping all order execution on the demo API. "
+            "Scan-only reads; never touches live portfolio or order endpoints."
+        ),
+    )
     return p.parse_args()
 
 
@@ -1206,6 +1255,7 @@ if __name__ == "__main__":
     trader = DemoTrader(
         duration_days=args.duration_days,
         dry_run=args.dry_run,
+        live_markets=args.live_markets,
     )
 
     try:

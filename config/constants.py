@@ -47,7 +47,7 @@ KELLY_FULL: float = 0.35          # Calibrated phase
 # ---------------------------------------------------------------------------
 MAX_POSITION_PCT: float = 0.05       # 5% of bankroll per position
 MIN_TRADE_SIZE: int = 5              # $5 minimum (5 contracts at $1 each)
-MAX_OPEN_POSITIONS: int = 5
+MAX_OPEN_POSITIONS: int = 20
 MAX_BANKROLL_IN_POSITIONS: float = 0.50   # 50% of bankroll max in open positions
 MAX_CORRELATED_EXPOSURE: float = 0.30     # 30% in same category/direction
 MAX_TRADE_SIZE_MICRO_LIVE: float = 10.00  # $10 hard cap during micro-live phase

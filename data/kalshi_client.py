@@ -716,3 +716,197 @@ class KalshiClient:
         if spread is None or spread > max_spread_cents:
             return False
         return True
+
+
+# ---------------------------------------------------------------------------
+# LiveMarketClient — read-only client pointing at the production Kalshi API.
+#
+# Used by --live-markets mode: fetches real bid/ask price data from the live
+# API while all order execution stays on the demo API via KalshiClient.
+#
+# SAFETY: this class intentionally has NO order-placement, portfolio, or
+# authentication methods.  Public market endpoints require no credentials.
+# ---------------------------------------------------------------------------
+
+_LIVE_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
+
+
+class LiveMarketClient:
+    """Read-only Kalshi market data client pointed at the live production API.
+
+    Exposes only `get_markets()`, `get_market()`, and `get_orderbook()`.
+    No authentication, no order placement, no portfolio access.
+
+    Safe to use alongside a demo KalshiClient — they share no state.
+
+    Usage::
+
+        live = LiveMarketClient()
+        scanner = MarketScanner(live)          # real bid/ask data
+        demo_exec = KalshiClient()             # paper orders on demo balance
+    """
+
+    def __init__(self, base_url: str = _LIVE_BASE_URL) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._session  = requests.Session()
+        self._session.headers.update({"Content-Type": "application/json"})
+        self._read_limiter = _TokenBucket(C.KALSHI_MAX_READS_PER_SEC)
+        logger.info("LiveMarketClient initialised  base_url=%s", self._base_url)
+
+    # ------------------------------------------------------------------
+    # Internal HTTP (GET only, never authenticated)
+    # ------------------------------------------------------------------
+
+    def _get(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        url = self._base_url + path
+        last_exc: Exception | None = None
+
+        for attempt in range(_MAX_RETRIES):
+            self._read_limiter.consume()
+            t0 = time.monotonic()
+            try:
+                resp = self._session.get(url, params=params, timeout=10)
+            except requests.exceptions.RequestException as exc:
+                logger.warning(
+                    "live_client_request  path=%s  attempt=%d  error=%s",
+                    path, attempt + 1, exc,
+                )
+                last_exc = exc
+                time.sleep(KalshiClient._backoff_seconds(attempt))
+                continue
+
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            logger.debug(
+                "live_client_request  path=%s  status=%d  latency_ms=%d",
+                path, resp.status_code, latency_ms,
+            )
+
+            if resp.status_code < 300:
+                return resp.json() if resp.content else {}
+
+            if resp.status_code not in _RETRYABLE_STATUS:
+                raise KalshiAPIError(resp.status_code, path, resp.text)
+
+            wait = KalshiClient._backoff_seconds(attempt)
+            last_exc = KalshiAPIError(resp.status_code, path, resp.text)
+            time.sleep(wait)
+
+        raise last_exc  # type: ignore[misc]
+
+    def _paginate(
+        self,
+        path: str,
+        result_key: str,
+        params: dict[str, Any] | None = None,
+        page_limit: int = 200,
+        max_pages:  int = 50,
+    ) -> list[dict[str, Any]]:
+        base_params: dict[str, Any] = dict(params or {})
+        base_params["limit"] = page_limit
+        all_items: list[dict[str, Any]] = []
+
+        for _ in range(max_pages):
+            data  = self._get(path, params=base_params)
+            items = data.get(result_key, [])
+            all_items.extend(items)
+            cursor = data.get("cursor")
+            if not cursor or not items:
+                break
+            base_params["cursor"] = cursor
+
+        return all_items
+
+    # ------------------------------------------------------------------
+    # Public read-only API (mirrors the same methods on KalshiClient)
+    # ------------------------------------------------------------------
+
+    # Categories whose markets PolyEdge strategies can trade.
+    # Maps Kalshi event-level category → whether to include.
+    _TARGET_CATEGORIES: frozenset[str] = frozenset({
+        "economics", "financials", "politics", "elections",
+        "science and technology", "companies", "world",
+        "climate and weather", "culture", "crypto",
+    })
+    _EXCLUDED_CATEGORIES: frozenset[str] = frozenset({
+        "sports", "sports and entertainment", "entertainment",
+    })
+
+    def get_markets(
+        self,
+        status: str = "open",
+        series_ticker: str | None = None,
+        event_ticker:  str | None = None,
+        tickers:       list[str] | None = None,
+        min_close_ts:  int | None = None,
+        max_close_ts:  int | None = None,
+        fetch_all: bool = True,
+    ) -> list[dict[str, Any]]:
+        """List live Kalshi markets (unauthenticated).
+
+        Uses the /events endpoint with nested markets to avoid the
+        sports-dominated /markets pagination problem.  The live API has
+        100K+ open markets — 95%+ are sports.  Fetching via /events
+        lets us skip sports at the event level and reach the ~3K
+        economics / politics / macro markets that PolyEdge can trade.
+        """
+        # If a specific ticker or event is requested, use /markets directly
+        if tickers or event_ticker or series_ticker:
+            params: dict[str, Any] = {"status": status}
+            if series_ticker:
+                params["series_ticker"] = series_ticker
+            if event_ticker:
+                params["event_ticker"] = event_ticker
+            if tickers:
+                params["tickers"] = ",".join(tickers)
+            if min_close_ts is not None:
+                params["min_close_ts"] = min_close_ts
+            if max_close_ts is not None:
+                params["max_close_ts"] = max_close_ts
+            if fetch_all:
+                return self._paginate("/markets", "markets", params=params)
+            return self._get("/markets", params=params).get("markets", [])
+
+        # Fetch all events with nested markets, then filter by category
+        events = self._paginate(
+            "/events", "events",
+            params={"status": status, "with_nested_markets": "true"},
+            page_limit=200, max_pages=50,
+        )
+
+        all_markets: list[dict[str, Any]] = []
+        for evt in events:
+            cat = (evt.get("category") or "").strip().lower()
+            # Skip sports / entertainment at the event level
+            if cat in self._EXCLUDED_CATEGORIES:
+                continue
+            nested = evt.get("markets") or []
+            # Inject event-level metadata into each market dict
+            evt_ticker = evt.get("event_ticker", "")
+            evt_category = evt.get("category", "")
+            for mkt in nested:
+                mkt.setdefault("event_ticker", evt_ticker)
+                mkt.setdefault("category", evt_category)
+                all_markets.append(mkt)
+
+        logger.info(
+            "live_markets_via_events  events=%d  markets=%d  (sports skipped)",
+            len(events), len(all_markets),
+        )
+        return all_markets
+
+    def get_market(self, ticker: str) -> dict[str, Any]:
+        """Fetch a single live market by ticker."""
+        data = self._get(f"/markets/{ticker}")
+        return data.get("market", data)
+
+    def get_orderbook(self, ticker: str, depth: int = 10) -> dict[str, Any]:
+        """Fetch the live order book for a market."""
+        data = self._get(
+            f"/markets/{ticker}/orderbook",
+            params={"depth": depth},
+        )
+        return data.get("orderbook", data)

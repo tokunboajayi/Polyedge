@@ -76,7 +76,7 @@ logger = logging.getLogger(__name__)
 _SLACK_TIMEOUT_S: float   = 8.0
 _MAX_RETRIES:      int    = 3
 _BUCKET_RATE:      float  = 1.0   # tokens / second
-_BUCKET_BURST:     int    = 3     # max burst tokens per channel
+_BUCKET_BURST:     int    = 10    # max burst tokens per channel
 
 # Emoji prefix per level
 _LEVEL_EMOJI: dict[str, str] = {

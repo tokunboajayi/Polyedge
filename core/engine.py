@@ -737,8 +737,10 @@ class Engine:
                 continue
 
             market_status = raw.get("status", "")
-            yes_ask       = raw.get("yes_ask") or 0
-            yes_bid       = raw.get("yes_bid") or 0
+            from data.market_scanner import _parse_price_cents
+            yes_ask       = _parse_price_cents(raw, "yes_ask") or 0
+            yes_bid       = _parse_price_cents(raw, "yes_bid") or 0
+            if not yes_ask or not yes_bid: continue
             current_yes   = (yes_ask + yes_bid) / 200.0
             close_time    = raw.get("close_time") or raw.get("expiration_time") or ""
 
@@ -923,8 +925,8 @@ class Engine:
                             title=alert.title,
                             source=alert.source,
                             url=alert.url,
-                            level=alert.alert_level,
-                            matched_keywords=alert.matched_keywords,
+                            alert_level=alert.alert_level,
+                            matched=alert.matched_keywords,
                             bankroll=self._bankroll,
                             open_positions=len(self._open_positions),
                         )
@@ -1197,8 +1199,10 @@ class Engine:
         for ticker in list(self._open_positions.keys()):
             try:
                 raw     = await asyncio.to_thread(self._client.get_market, ticker)
-                yes_ask = raw.get("yes_ask") or 0
-                yes_bid = raw.get("yes_bid") or 0
+                from data.market_scanner import _parse_price_cents
+                yes_ask = _parse_price_cents(raw, "yes_ask") or 0
+                yes_bid = _parse_price_cents(raw, "yes_bid") or 0
+                if not yes_ask or not yes_bid: continue
                 current = (yes_ask + yes_bid) / 200.0
                 await self._close_position(ticker, current, "shutdown")
             except Exception as exc:

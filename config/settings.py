@@ -42,13 +42,13 @@ KALSHI_ENV: str = _optional("KALSHI_ENV", "demo")
 KALSHI_BASE_URL: str = (
     "https://demo-api.kalshi.co/trade-api/v2"
     if KALSHI_ENV == "demo"
-    else "https://api.kalshi.com/trade-api/v2"
+    else "https://api.elections.kalshi.com/trade-api/v2"
 )
 
 KALSHI_WS_URL: str = (
     "wss://demo-api.kalshi.co/trade-api/ws/v2"
     if KALSHI_ENV == "demo"
-    else "wss://api.kalshi.com/trade-api/ws/v2"
+    else "wss://api.elections.kalshi.com/trade-api/ws/v2"
 )
 
 # ---------------------------------------------------------------------------

@@ -82,21 +82,32 @@ CATEGORY_MAP: dict[str, str] = {
 
 SUPPORTED_CATEGORIES: frozenset[str] = frozenset({
     "economics", "politics", "regulatory", "macro", "tech",
+    "climate", "companies",
 })
 
 #: Maps Kalshi event-level category strings (from /events) to PolyEdge canonical.
 _EVENT_CATEGORY_MAP: dict[str, str] = {
     "politics":               "politics",
     "elections":              "politics",
+    "world":                  "politics",
     "economics":              "economics",
     "financials":             "economics",
+    "companies":              "companies",
     "macro":                  "macro",
     "crypto":                 "tech",
     "science and technology": "tech",
     "technology":             "tech",
+    "climate and weather":    "climate",
+    "climate":                "climate",
+    "health":                 "economics",
+    "transportation":         "economics",
+    "mentions":               "politics",
+    "social":                 "politics",
     "regulatory":             "regulatory",
     "sports":                 "sports",
+    "sports and entertainment": "sports",
     "entertainment":          "entertainment",
+    "culture":                "entertainment",
 }
 
 #: Series prefix → PolyEdge category (uppercase keys).

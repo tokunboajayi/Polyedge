@@ -25,12 +25,12 @@ replacing the live DB (after shutting down the engine).
 
 Configuration (from .env)
 --------------------------
-  B2_KEY_ID       — Backblaze account key ID
-  B2_APPLICATION_KEY — Backblaze application key
-  B2_BUCKET_NAME  — target bucket name
+  BACKBLAZE_KEY_ID       — Backblaze account key ID
+  BACKBLAZE_APPLICATION_KEY — Backblaze application key
+  BACKBLAZE_BUCKET_NAME  — target bucket name
 
-If B2 credentials are absent, backup still runs locally and logs a warning
-about the missing upload step.
+If Backblaze credentials are absent, backup still runs locally and logs a
+warning about the missing upload step.
 
 Dependencies
 -----------
@@ -249,8 +249,8 @@ class BackupManager:
 
         try:
             from config import settings as S
-            key_id  = S.B2_KEY_ID
-            app_key = S.B2_APPLICATION_KEY
+            key_id  = S.BACKBLAZE_KEY_ID
+            app_key = S.BACKBLAZE_APPLICATION_KEY
         except AttributeError:
             logger.warning("B2 credentials not configured — skipping upload")
             return None, None
@@ -262,7 +262,7 @@ class BackupManager:
         info = InMemoryAccountInfo()
         api  = B2Api(info)
         api.authorize_account("production", key_id, app_key)
-        return api, S.B2_BUCKET_NAME
+        return api, S.BACKBLAZE_BUCKET_NAME
 
     def _upload_b2(self, local_path: Path, remote_name: str) -> bool:
         """Upload local_path to B2 bucket. Returns True on success."""
